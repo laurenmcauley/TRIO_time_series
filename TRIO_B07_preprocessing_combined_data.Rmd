@@ -1,0 +1,850 @@
+---
+title: "Untitled"
+output: html_document
+date: "2023-01-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#### Background ##
+Hurvitz et al (2020) published clinical trial data examining the efficacy of chemotherapy plus combinations of the HER2-targeted therapies trastuzumab and lapatibib. Tumour samples were collected at baseline, 2-3 weeks after starting HER2-targeted therapy, and at surgery.
+
+Microarray was performed using the Agilent Whole Human Genome Microarray Kit, 4x44K (GPL6480). This microarray targets 19,596 Entrez gene RNAs. The design of this microarray was based on Goldenpath Ensembl Unigene Human Genome (Build 33 - GRCh38.p13), RefSeq and Genbank. (https://www.agilent.com/en/human-gene-expression-microarrays-details-specifications)
+
+
+Downloaded .tar files for Hurvitz TRIO_B07 trial (2020) from GEO - it's split into two smaller datasets (GSE130786 and GSE130787). Gunzipped the folders and then deleted the .gz files from the terminal, leaving only .txt files. Using limma version 3.54.0 to read in and normalise files. See TRIO_B07_timeseriesanalysis_env_setup.Rmd for other packages used. 
+
+Files from the two GEO series were processed together - whether they were processed separately and then combined or combined first and then processed made no difference whatsoever. Both expression matrices were exactly the same. But this file has raw files combined and processed together. 
+
+
+
+## What is in this file? ##
+1. Read in metadata from series matrix file on GEO and QC metadata. Clean it up
+2. Reading in raw files using read.maimages()
+3. Extract scan dates from raw files and add them into metadata dataframe. 
+4. Background correction 
+5. Normalisation
+6. PCA
+7. Identify control probes
+8. Averaging replicates, remove control probes and extract expression data. 
+9. Combine normalised, cleaner baseline and on-treatment datasets. 
+10. Identify patients with samples taken both at baseline and on-treatment. 
+11. Assign matched samples with a patient ID. 
+12. Filter out probes with low variance across all samples. 
+13A. Batch correction by scandate with ComBat.
+13B. gPCA to measure batch effect. 
+
+
+
+Next, perform differential expression analysis:
+- Using limma (see "TRIO_B07_broad_limma.Rmd" and "TRIO_BO7_ResponseArm_limma.Rmd")
+- Using TTCA
+- Using maSigPro
+- Perform variations of these methods with batch correction - no batch correction, ComBat, ComBat-Corr, or account for batch in limma design (in respective files as above)
+
+
+#1. Reading in metadata
+
+```{r}
+###########
+## Baseline
+# Pulling the baseline data from GEO
+baseline_gset <- getGEO("GSE130786", GSEMatrix =TRUE, getGPL=FALSE)
+if (length(baseline_gset) > 1) idx <- grep("GPL6480", attr(baseline_gset, "names")) else idx <- 1
+geo_baseline_eset <- baseline_gset[[idx]]
+
+dim(geo_baseline_eset) #41k probes. 
+
+colnames(pData(geo_baseline_eset))
+#no FileName column
+
+#Hurvitz paper says there's some one-channel data somewhere but I cant find it. 
+#geo_baseline_eset$channel_count #2 channels
+#geo_baseline_eset$characteristics_ch1 #tumour reference mix
+#geo_baseline_eset$characteristics_ch2 #baseline breast tumour
+
+
+```
+
+Pull metadata and rename columns to be R-friendly
+
+```{r}
+
+head(pData(geo_baseline_eset[,28:36]))
+
+baseline_eset_metadata <- pData(geo_baseline_eset)[,c("geo_accession", "characteristics_ch2", "characteristics_ch2.1", "characteristics_ch2.2", "characteristics_ch2.3", "characteristics_ch2.4", "drug response:ch2", "er status (ihc staining results):ch2", "pr_status (ihc staining results):ch2", "sample type:ch2", "treatment group:ch2")]
+
+colnames(baseline_eset_metadata)
+
+names(baseline_eset_metadata) <- c("geo_accession", "sample_type1", "er_status1", "pr_status1", "treatment_group1", "drug_response1", "drug_response_ch2", "er_status_ihc_staining_results_ch2", "pr_status_ihc_staining_results_ch2", "sample_type_ch2", "treatment_group_ch2")
+
+names(baseline_eset_metadata)
+
+```
+
+Notice how some columns contain the same data (see below). Cross-reference these to make sure the data is consistent across the samples. To make this easier, clean the data first (e.g. remove "sample type:" from the strings in the sample_type1 column so it can be easily compared to the sample_type_ch2 column. 
+
+```{r}
+head(baseline_eset_metadata[, c("sample_type1", "sample_type_ch2")])
+```
+
+```{r}
+#remove unnecessary text
+baseline_eset_metadata$sample_type1 <- sub("sample type: ", "", baseline_eset_metadata$sample_type1)
+baseline_eset_metadata$er_status1 <- gsub("er status (ihc staining results): ", "", baseline_eset_metadata$er_status1, fixed = TRUE) #only works when fixed = TRUE for some reason. 
+baseline_eset_metadata$pr_status1 <- gsub("pr_status (ihc staining results): ", "", baseline_eset_metadata$pr_status1,  fixed = TRUE) #same here
+baseline_eset_metadata$treatment_group1 <- sub("treatment group: ", "", baseline_eset_metadata$treatment_group1)
+baseline_eset_metadata$drug_response1 <- sub("drug response: ", "", baseline_eset_metadata$drug_response1)
+
+
+#compare columns that contain same data to make sure its consistent across all samples (n = 110)
+length(which(ifelse(baseline_eset_metadata$sample_type1==baseline_eset_metadata$sample_type_ch2, "MATCH", "no")=="MATCH"))
+length(which(ifelse(baseline_eset_metadata$er_status1==baseline_eset_metadata$er_status_ihc_staining_results_ch2, "MATCH", "no")=="MATCH"))
+length(which(ifelse(baseline_eset_metadata$pr_status1==baseline_eset_metadata$pr_status_ihc_staining_results_ch2, "MATCH", "no")=="MATCH"))
+length(which(ifelse(baseline_eset_metadata$treatment_group1==baseline_eset_metadata$treatment_group_ch2, "MATCH", "no")=="MATCH"))
+length(which(ifelse(baseline_eset_metadata$drug_response1==baseline_eset_metadata$drug_response_ch2, "MATCH", "no")=="MATCH"))
+#all output 89 matches
+
+#so now remove the repeated columns from baseline_eset_metadata. #doing this by selecting the columns i want to keep
+baseline_eset_metadata <- baseline_eset_metadata %>% dplyr::select("geo_accession":"drug_response1")
+
+#rename the columns
+names(baseline_eset_metadata) <- c("geo_accession", "sample_type", "er_status", "pr_status", "treatment_group", "drug_response")
+
+```
+
+Retrieve on-treatment metadata
+```{r}
+#Pulling the treatments data from GEO to extract metadata. 
+treatments_gset <- getGEO("GSE130787", GSEMatrix =TRUE, getGPL=FALSE)
+if (length(treatments_gset) > 1) idx <- grep("GPL6480", attr(treatments_gset, "names")) else idx <- 1
+geo_treatments_eset <- treatments_gset[[idx]]
+
+head(pData(geo_treatments_eset))
+
+#Hurvitz paper says there's some one-channel data somewhere but I cant find it. 
+geo_treatments_eset$channel_count #2 chanels
+geo_treatments_eset$characteristics_ch1 #baseline breast tumour
+geo_treatments_eset$characteristics_ch2 #"sample type: after 2-weeks of treatments with HER2-targeted therapy"
+
+
+#remove unneeded objects
+rm(idx)
+```
+
+```{r}
+#Pull metadata and rename columns to be R-friendly.#
+colnames(pData(geo_treatments_eset))
+
+treatments_eset_metadata <- pData(geo_treatments_eset)[,c("geo_accession", "characteristics_ch2", "characteristics_ch2.1", "characteristics_ch2.2", "characteristics_ch2.3", "characteristics_ch2.4", "drug response:ch2", "er status (ihc staining results):ch2", "pr_status (ihc staining results):ch2", "sample type:ch2", "treatment group:ch2")]
+
+colnames(treatments_eset_metadata)
+
+names(treatments_eset_metadata) <- c("geo_accession", "sample_type1", "er_status1", "pr_status1", "treatment_group1", "drug_response1", "drug_response_ch2", "er_status_ihc_staining_results_ch2", "pr_status_ihc_staining_results_ch2", "sample_type_ch2", "treatment_group_ch2")
+
+names(treatments_eset_metadata)
+
+```
+
+Same as above baseline metadata with repeated information. 
+
+```{r}
+head(treatments_eset_metadata[, c("sample_type1", "sample_type_ch2")])
+```
+
+```{r}
+#remove unnecessary text
+treatments_eset_metadata$sample_type1 <- sub("sample type: ", "", treatments_eset_metadata$sample_type1)
+treatments_eset_metadata$er_status1 <- gsub("er status (ihc staining results): ", "", treatments_eset_metadata$er_status1, fixed = TRUE) #only works when fixed = TRUE for some reason. 
+treatments_eset_metadata$pr_status1 <- gsub("pr_status (ihc staining results): ", "", treatments_eset_metadata$pr_status1,  fixed = TRUE) #same here
+treatments_eset_metadata$treatment_group1 <- sub("treatment group: ", "", treatments_eset_metadata$treatment_group1)
+treatments_eset_metadata$drug_response1 <- sub("drug response: ", "", treatments_eset_metadata$drug_response1)
+
+
+#compare columns that contain same data to make sure its consistent across all samples (n = 89)
+length(which(ifelse(treatments_eset_metadata$sample_type1==treatments_eset_metadata$sample_type_ch2, "MATCH", "no")=="MATCH"))
+length(which(ifelse(treatments_eset_metadata$er_status1==treatments_eset_metadata$er_status_ihc_staining_results_ch2, "MATCH", "no")=="MATCH"))
+length(which(ifelse(treatments_eset_metadata$pr_status1==treatments_eset_metadata$pr_status_ihc_staining_results_ch2, "MATCH", "no")=="MATCH"))
+length(which(ifelse(treatments_eset_metadata$treatment_group1==treatments_eset_metadata$treatment_group_ch2, "MATCH", "no")=="MATCH"))
+length(which(ifelse(treatments_eset_metadata$drug_response1==treatments_eset_metadata$drug_response_ch2, "MATCH", "no")=="MATCH"))
+#all output 89 matches
+
+#so now remove the repeated columns from treatments_eset_metadata. #doing this by selecting the columns i want to keep
+treatments_eset_metadata <- treatments_eset_metadata %>% dplyr::select("geo_accession":"drug_response1")
+
+#rename the columns
+names(treatments_eset_metadata) <- c("geo_accession", "sample_type", "er_status", "pr_status", "treatment_group", "drug_response")
+
+```
+
+
+# 2. Reading in raw files using read.maimages() #
+
+
+```{r}
+#first remove .gz files from the directories of raw data in the terminal (move to directory and type rm *.gz)
+
+# Read in baseline data to create an RGList object
+baseline_raw_files <- list.files(path = "/home/lauren/Documents/TRIO_B07_timeseriesanalysis/TRIOB07_Hurvitz_rawdata/GSE130786_RAW/", all.files = FALSE) #list of file names
+baseline_raw_data <- read.maimages(files = baseline_raw_files, path = "/home/lauren/Documents/TRIO_B07_timeseriesanalysis/TRIOB07_Hurvitz_rawdata/GSE130786_RAW/", source = "agilent") #get images from these files
+
+
+# Read in treaments data to create an RGList object
+treatments_raw_files <- list.files(path = "/home/lauren/Documents/TRIO_B07_timeseriesanalysis/TRIOB07_Hurvitz_rawdata/GSE130787_RAW/", all.files = FALSE) #list file names
+treatments_raw_data <- read.maimages(files = treatments_raw_files, path = "/home/lauren/Documents/TRIO_B07_timeseriesanalysis/TRIOB07_Hurvitz_rawdata/GSE130787_RAW/", source = "agilent")
+
+
+#delete unneeded objects
+rm(baseline_raw_files, treatments_raw_files) #these are only the lists of filenames
+```
+
+
+# 3. Extract microarray scan dates from raw files and add into metadata dataframes. 
+This process took ages to run. Scan dates were stored in each sample's txt file. Had to convert the txt file for each sample to a csv. A for loop finds the scand dates in each sample's csv file. Then scandates are added to the baseline and treatments metadata sets. 
+I put the dates in scandates_vector so this doesnt have to be run again, only run the few lines of code at the end of this chunk.  
+
+```{r}
+# ### Want to extract scan dates from the raw files. 
+# # First convert all raw txt files to csv files. 
+# 
+# ## Baseline samples
+# # create a directory called GSE130786_csv in the TRIOB07_Hurvitz_rawdata directory
+# dir_create("/home/lauren/Documents/TRIO_B07_timeseriesanalysis/TRIOB07_Hurvitz_rawdata/GSE130786_csv")
+# 
+# baseline_directory <-"/home/lauren/Documents/TRIO_B07_timeseriesanalysis/TRIOB07_Hurvitz_rawdata/GSE130786_RAW/"   
+# baseline_ndirectory <- "/home/lauren/Documents/TRIO_B07_timeseriesanalysis/TRIOB07_Hurvitz_rawdata/GSE130786_csv"
+# 
+# baseline_file_name <- list.files(baseline_directory, pattern = "GSM")
+# 
+# baseline_files.to.read <- paste(baseline_directory, baseline_file_name, sep="/") 
+# baseline_files.to.write <- paste(baseline_ndirectory, paste0(sub(".txt","", baseline_file_name),".csv"), sep="/")
+# 
+# for (i in 1:length(baseline_files.to.read)) {
+#   temp <- (read.delim(baseline_files.to.read[i], header = FALSE, sep = "\t"))
+#   write.csv(temp, file = baseline_files.to.write[i])
+# }
+# 
+# # Now import the first few lines where scan info is. Makes a dataframe containing dataframes. 
+# baseline_csvfiles <- list.files("/home/lauren/Documents/TRIO_B07_timeseriesanalysis/TRIOB07_Hurvitz_rawdata/GSE130786_csv", pattern = "GSM")
+# baseline_csvpaths <- gsub("GSM", "/home/lauren/Documents/TRIO_B07_timeseriesanalysis/TRIOB07_Hurvitz_rawdata/GSE130786_csv/GSM", baseline_csvfiles)
+# baseline_scanslist <- lapply(baseline_csvpaths, FUN=read.csv, header=FALSE, sep = c(","), nrows = 5)
+# 
+# 
+# # Pull out scan date for one file
+# baseline_scanslist[[1]][4,7] #scan date and time
+# 
+# 
+# # Pull out all scan dates and put them beside the GEO accession from the file name. 
+# # Scan dates will be in order of csvfile names. So just add on a column of filenames and extract GEO accessions from those. 
+# baseline_geo_accession <- str_extract(baseline_file_name, "^.{1,10}")
+# 
+# baseline_scandates <- data.frame()
+# 
+# for (i in 1:110)  #for each dataframe in scanslist
+# {
+#   baseline_scandates[i,"geo_accession"] <- baseline_geo_accession[i]
+#   baseline_scandates[i,"scandate"] <- baseline_scanslist[[i]][4,7]
+# }
+# 
+# 
+# #leftjoin scandates with metadata
+# baseline_eset_metadata <- baseline_eset_metadata %>% left_join(baseline_scandates) #actually contains date and time
+# baseline_eset_metadata$scandate <- str_extract(baseline_eset_metadata$scandate, "^.{1,10}") # keep date only
+# 
+# 
+# ## On-treatment samples
+# # made a directory called GSE130787_csv in the TRIOB07_Hurvitz_rawdata directory
+# dir_create("/home/lauren/Documents/TRIO_B07_timeseriesanalysis/TRIOB07_Hurvitz_rawdata/GSE130787_csv")
+# treatments_directory <-"/home/lauren/Documents/TRIO_B07_timeseriesanalysis/TRIOB07_Hurvitz_rawdata/GSE130787_RAW/"
+# treatments_ndirectory <- "/home/lauren/Documents/TRIO_B07_timeseriesanalysis/TRIOB07_Hurvitz_rawdata/GSE130787_csv"
+# 
+# treatments_file_name <- list.files(treatments_directory, pattern = "GSM")
+# 
+# treatments_files.to.read <- paste(treatments_directory, treatments_file_name, sep="/") 
+# treatments_files.to.write <- paste(treatments_ndirectory, paste0(sub(".txt","", treatments_file_name),".csv"), sep="/")
+# 
+# for (i in 1:length(treatments_files.to.read)) {
+#   temp <- (read.delim(treatments_files.to.read[i], header = FALSE, sep = "\t"))
+#   write.csv(temp, file = treatments_files.to.write[i])
+# }
+# 
+# # Now import the first few lines where scan info is. Makes a dataframe containing dataframes. 
+# treatments_csvfiles <- list.files("/home/lauren/Documents/TRIO_B07_timeseriesanalysis/TRIOB07_Hurvitz_rawdata/GSE130787_csv", pattern = "GSM")
+# treatments_csvpaths <- gsub("GSM", "/home/lauren/Documents/TRIO_B07_timeseriesanalysis/TRIOB07_Hurvitz_rawdata/GSE130787_csv/GSM", treatments_csvfiles)
+# treatments_scanslist <- lapply(treatments_csvpaths, FUN=read.csv, header=FALSE, sep = c(","), nrows = 5)
+# 
+# 
+# # Pull out scan date for one file
+# treatments_scanslist[[1]][4,7] #scan date and time
+# 
+# 
+# # Pull out all scan dates and put them beside the GEO accession from the file name. 
+# # Scan dates will be in order of csvfile names. So just add on a column of filenames and extract GEO accessions from those. 
+# treatments_geo_accession <- str_extract(treatments_file_name, "^.{1,10}")
+# 
+# treatments_scandates <- data.frame()
+# 
+# for (i in 1:89)  #for each dataframe in scanslist
+# {
+#   treatments_scandates[i,"geo_accession"] <- treatments_geo_accession[i]
+#   treatments_scandates[i,"scandate"] <- treatments_scanslist[[i]][4,7]
+# }
+# 
+# # # USE THIS IF txt-to-csv LOOP RAN
+# # #leftjoin scandates with metadata
+# # treatments_eset_metadata <- treatments_eset_metadata %>% left_join(treatments_scandates) #actually contains date and time
+# # treatments_eset_metadata$scandate <- str_extract(treatments_eset_metadata$scandate, "^.{1,10}") # keep date only
+# 
+
+
+
+
+
+#####  USE TO AVOID RUNNING txt-to-csv LOOP #####
+#vector with ALL scandates (baseline and on-treatment samples)
+scandates_vector <- c("09-27-2011", "08-26-2011", "05-04-2011", "09-02-2011", "08-26-2011", "09-27-2011", "09-30-2011", "09-30-2011", "09-01-2011", "05-17-2011", "05-17-2011", "05-17-2011", "08-26-2011", "05-17-2011", "08-26-2011", "05-17-2011", "05-17-2011", "06-28-2011", "08-26-2011", "08-12-2011", "06-28-2011", "06-28-2011", "06-28-2011", "06-28-2011", "06-28-2011", "08-26-2011", "06-28-2011", "09-27-2011", "09-07-2011", "09-02-2011", "08-12-2011", "06-28-2011", "09-27-2011", "09-01-2011", "08-26-2011", "08-12-2011", "09-02-2011", "09-07-2011", "08-12-2011", "08-12-2011", "08-12-2011", "08-12-2011", "09-01-2011", "08-12-2011", "08-25-2011", "08-25-2011", "08-25-2011", "08-25-2011", "08-25-2011", "08-25-2011", "08-25-2011", "09-30-2011", "08-25-2011", "08-25-2011", "09-01-2011", "11-05-2013", "08-26-2011", "09-01-2011", "09-01-2011", "10-22-2013", "09-01-2011", "09-30-2011", "09-02-2011", "09-02-2011", "09-07-2011", "09-02-2011", "09-02-2011", "09-02-2011", "09-30-2011", "09-02-2011", "09-07-2011", "10-01-2013", "10-01-2013", "10-01-2013", "10-01-2013", "10-01-2013", "10-01-2013", "10-04-2013", "10-04-2013", "10-04-2013", "10-04-2013", "10-04-2013", "10-04-2013", "10-04-2013", "10-04-2013", "10-04-2013", "10-04-2013", "10-04-2013", "10-04-2013", "10-04-2013", "10-08-2013", "10-08-2013", "10-08-2013", "10-08-2013", "10-08-2013", "09-05-2013", "10-08-2013", "10-08-2013", "10-08-2013", "10-04-2013", "10-08-2013", "10-08-2013", "10-08-2013", "10-08-2013", "10-08-2013", "10-08-2013", "10-08-2013", "10-08-2013", "10-08-2013", "10-08-2013", "08-26-2011", "05-04-2011", "09-02-2011", "08-26-2011", "09-30-2011", "09-30-2011", "09-01-2011", "05-17-2011", "05-17-2011", "05-17-2011", "08-26-2011", "05-17-2011", "08-26-2011", "05-17-2011", "09-01-2011", "06-28-2011", "08-26-2011", "08-12-2011", "06-28-2011", "06-28-2011", "06-28-2011", "06-28-2011", "08-26-2011", "06-28-2011", "09-01-2011", "09-02-2011", "08-12-2011", "06-28-2011", "09-27-2011", "09-01-2011", "08-26-2011", "09-02-2011", "09-07-2011", "08-12-2011", "08-12-2011", "08-12-2011", "09-01-2011", "08-25-2011", "08-25-2011","08-25-2011", "08-25-2011", "08-25-2011", "08-25-2011", "08-25-2011", "09-01-2011", "09-01-2011", "08-26-2011", "09-01-2011", "09-01-2011", "10-22-2013", "09-01-2011", "09-30-2011", "09-02-2011", "09-02-2011", "09-07-2011", "09-02-2011", "09-02-2011", "09-02-2011", "09-30-2011", "09-02-2011", "09-07-2011", "08-20-2013", "10-01-2013", "10-01-2013", "10-04-2013", "08-20-2013", "08-20-2013", "08-20-2013", "08-20-2013", "08-20-2013", "10-04-2013", "10-22-2013", "10-04-2013", "10-08-2013", "10-08-2013", "10-08-2013", "09-05-2013", "10-08-2013", "08-20-2013", "08-20-2013", "08-20-2013", "08-20-2013", "10-08-2013", "10-08-2013", "10-08-2013", "10-08-2013", "10-08-2013", "08-20-2013", "10-08-2013")
+
+#leftjoin scandates with metadata
+baseline_eset_metadata <- baseline_eset_metadata %>% mutate(scandate =scandates_vector[1:110])
+treatments_eset_metadata <- treatments_eset_metadata %>% mutate(scandate =scandates_vector[111:199])
+
+
+
+#delete unneeded objects when finished
+#rm(baseline_directory, baseline_ndirectory, baseline_file_name, baseline_files.to.read, baseline_files.to.write, baseline_csvfiles, baseline_csvpaths, baseline_scanslist, baseline_geo_accession, baseline_scandates, i)
+#rm(treatments_directory, treatments_ndirectory, treatments_file_name, treatments_files.to.read, treatments_files.to.write, treatments_csvfiles, treatments_csvpaths, treatments_scanslist, temp, treatments_geo_accession, treatments_scandates)
+
+#note: can now also delete the GSE130786_csv and GSE130787_csv directories and all the csv files made
+```
+
+# 4. Merge baseline and on-treatment files into one object.
+
+```{r}
+
+#combine the metadata sets;
+combined_eset_metadata <- rbind(baseline_eset_metadata, treatments_eset_metadata)
+
+#If scandates_vector will be used; 
+
+
+#combine raw esets
+combined_eset <- cbind(baseline_raw_data, treatments_raw_data) #still class RGList, just now with both raw RGListscombined.    #45105 probes and 199 samples
+
+
+```
+
+
+# 5. Background correction. 
+Background correction (bgc) removes noise in gene expression data. Raw intensities must be "offset" to ensure that variability across log-ratios remains as constant as possible. 
+
+Visually, MA plots can be used to determine if the chosen offset value is appropriate. Lots of spread at low intensities indicates instability. 
+ref: https://support.bioconductor.org/p/40863/
+
+For a more solid examination of offset suitability, can look at fit$df.prior after using eBayes(). A larger df.prior indicates greater stability across variances, with the maximum df.prior being optimal in theory. 
+ref: https://support.bioconductor.org/p/12545/
+
+However, the larger offset values also run the risk of introducing bias by reducing fold changes. Need to optimise noise vs bias trade-off. See: PMID 20929874
+
+I started with an offset of 20. The MA plots look good, but I'll run it with a few different values between 0-50 and see which one is best (in terms of DEGs vs FDR, and fit$df.prior). Best to keep the offset value small to avoid introducing bias. 
+
+**Optimising offset**
+See optimising_offset.Rmd
+
+```{r}
+# start with offset of 20. 
+combined_bgc_data_20 <- limma::backgroundCorrect(combined_eset, method = 'normexp', offset = 20) 
+
+```
+
+
+# 6. Normalisation #
+Getting the impression that quantile normalisation should be avoided. PMID: 10.1038/s41598-020-72664-6
+Normexp background correction and loess within array normalisaiton was best of the assessed options according to PMID: 21414985.
+
+No background correction and loess within array normalisation performed slightly better compared to background correction with loess normalisation PMID: 17472750.
+There was less variability when background correction was not performed.
+
+Hurvitz et al did normexp background correction and used loess normalisation, so I'll also do this. 
+
+This produces an MAList object - the M values are log transformed expression values - M values are log2(Cy5 intensity) - log2(Cy3 intensity).
+
+
+```{r}
+#normalise within arrays
+combined_bgc_data_20_norm <- normalizeWithinArrays(combined_bgc_data_20, method = 'loess') #normalise using loess  
+                                                                                          #produces a list of lists
+
+
+# basic boxplot
+boxplot(combined_bgc_data_20_norm$M) #looks weird but ok
+
+
+# # ggplot boxplot
+# ggplot_combined_bgc_data_20_norm <- melt(combined_bgc_data_20_norm$M) #need expression values in long format for ggplot
+# 
+# colnames(ggplot_combined_bgc_data_20_norm) <- c("probe", "geo_accession", "expression_value") #might need to change colnames, check once i do annotation. not having probe names doesnt matter right now 
+# 
+# ggplot_combined_bgc_data_20_norm$geo_accession <- str_extract(ggplot_combined_bgc_data_20_norm$geo_accession, "^.{1,10}")
+# 
+# ##Use a left_join to cross-reference the long form of expression values against the eset_metadata and add the sample type to the ggplot_combined_eset. #theyre all the same sample type right now. 
+# #ggplot_combined_eset <- left_join(ggplot_combined_eset, combined_eset_metadata %>% dplyr::select(geo_accession, sample_type), by = "geo_accession")
+# 
+# 
+# #Make a boxplot of expression values for each sample and colour by sample type.
+# ggplot(ggplot_combined_bgc_data_20_norm[1:2000000,], aes(x = geo_accession, y = expression_value)) + #
+#   geom_boxplot(colour = "gray50", width=1, outlier.size = 7.4, position=position_dodge(width=0.1)) +
+#   xlab(label = "geo_accession") +
+#   ylab(label = "log2(Expression)") +
+#   labs(title = "Distribution of gene expression across all samples")
+       
+```
+
+
+#7. Visualise normalised data with PCA
+PCA performed using the background corrected, normalised data. 
+
+```{r}
+## PCA BEFORE BATCH CORRECTION
+combined_pca_proc<- prcomp(t(combined_bgc_data_20_norm$M)) #should I replace with filtered one - no control probes etc? 
+
+#calculate PC1 and PC2.
+combined_pcvalue1 = round(100*combined_pca_proc$sdev[1]^2/(sum(combined_pca_proc$sdev^2)),1)
+combined_pcvalue2 = round(100*combined_pca_proc$sdev[2]^2/(sum(combined_pca_proc$sdev^2)),1)
+
+
+#need long format eset for ggplot graphs - made in above chunk too
+ggplot_combined_bgc_data_20_norm <- melt(combined_bgc_data_20_norm$M) #need expression values in long format for ggplot
+colnames(ggplot_combined_bgc_data_20_norm) <- c("probe", "geo_accession", "expression_value") #might need to change colnames, check once i do annotation. not having probe names doesnt matter right now 
+ggplot_combined_bgc_data_20_norm$geo_accession <- str_extract(ggplot_combined_bgc_data_20_norm$geo_accession, "^.{1,10}")
+
+
+
+#make a dataframe with PC1/2 values, metadata from eset, left-join to get sample types. 
+PC1_2_combined_meta <- data.frame(PC1 = combined_pca_proc$x[,1], PC2 = combined_pca_proc$x[,2], geo_accession = unique(ggplot_combined_bgc_data_20_norm$geo_accession))
+PC1_2_combined_meta <- left_join(PC1_2_combined_meta, combined_eset_metadata %>% dplyr::select(geo_accession, sample_type, drug_response, er_status, pr_status, treatment_group,scandate), by = "geo_accession")
+
+#PCA plot to look at variance between samples
+PC1_2_combined_eset_plot <- ggplot(data = PC1_2_combined_meta) + 
+  geom_point(mapping = aes(x = PC1, 
+                           y = PC2,
+                           color = scandate,#sample_type
+                           shape = sample_type), #drug response
+             size = 4, 
+             alpha = 0.5) + 
+  labs(x=paste0("PC1 (",combined_pcvalue1,"%)"), y=paste0("PC2 (",combined_pcvalue2,"%)"), size = 5)
+
+PC1_2_combined_eset_plot
+
+#png(file="PC1_2_combined_eset.png", width=30*pcvalue1, height=30*pcvalue2, units="px")
+#PC1_2_combined_eset_plot
+#dev.off()
+
+rm(combined_pca_proc, combined_pcvalue1, combined_pcvalue2, PC1_2_combined_meta)
+```
+
+
+# 8. Identify control probes
+
+```{r}
+### Control type given as 0, 1, -1 from MAlist$gene. 
+table(combined_bgc_data_20_norm$genes$ControlType)     # count the types of probes - negative (153), positive (1486), non-control (43,376)
+
+
+#Get avg of replicate probes and remove controls
+experimental_probes <- combined_bgc_data_20_norm$genes %>% filter(ControlType == 0)
+
+
+#However, there are only 4100 unique probes, just have replicates of some - view table below to see more. These replicate probes can be averaged 
+dim(table(experimental_probes$ProbeName))
+```
+
+# 9. Average replicate probes, REMOVE control probes, and put expression data into a new object so it is a matrix.
+Each sample contains replicate probes. Find the average of the replicates in each sample and replace the probe values with this average. Have to do this after normalisation because raw intensity values are skewed. Only take average after log transformation (which was done for us by normaliseWtihinArrays). 
+
+MAList objects have a genes dataframe that has probe names and systematic names. Probe name is given by manufacturer, systematic name is the transcript a given probe is meant to measure. If you average by duplicate probes on the array, then do averaging according to probe name. If you want to average by transcript/gene, then use the systematic name. 
+
+Note: averaging of replicate probes is within samples, so filtering low variance probes after this will be fine as there will still be variance between samples. 
+
+```{r}
+#avereps fxn will make rownames as probeIDs, will enable us to remove control probes. 
+combined_bgc_data_20_norm <- avereps(
+  combined_bgc_data_20_norm,
+  ID = combined_bgc_data_20_norm$genes$ProbeName)   #now rownames of MAList are probeIDs. This fxn removes replicates. Next remove controls. 
+
+
+#filter to keep only the experimental probes - 41k probes 
+combined_bgc_data_20_norm <- combined_bgc_data_20_norm[rownames(combined_bgc_data_20_norm) %in% experimental_probes$ProbeName,]
+
+
+#extract the eset
+combined_eset <- combined_bgc_data_20_norm$M
+dim(combined_eset) #41000 199
+colnames(combined_eset) <- str_extract(colnames(combined_eset), "^.{1,10}")
+
+
+
+rm(experimental_probes)
+```
+
+# 10. Identify patients with samples taken both at baseline and on-treatment. Take these matched samples and assign them a patient ID. 
+At baseline, a reference mix (source_name_ch1) and a baseline sample (source_name_ch2) were hybridized to the array. For on-treatment samples, a baseline sample (source_name_ch1) and an on-treatment sample (source_name_ch2) were hybridised to thr array. So, source_name_ch2 from baseline and source_name_ch1 from on-treatment will be the same for matched samples. 
+
+```{r}
+#where geo_baseline_eset$source_name_ch2 and geo_treatments_eset$source_name_ch1, thats the same patient. get the two GEO numbers with matching sources and give them the same PT_ID. 
+
+x <- pData(geo_baseline_eset) %>% dplyr::select(geo_accession, source_name_ch2)   #made geo_baseline_eset in section 1
+y <- pData(geo_treatments_eset)  %>% dplyr::select(geo_accession, source_name_ch1)
+
+#get baselines that have a matching source in treatments. 
+x <- x %>% filter(source_name_ch2 %in% y$source_name_ch1)
+
+#merge the GEOs according to matching sources. 
+matched <- x %>% full_join(y, by = join_by(source_name_ch2 == source_name_ch1))
+
+#give each match a patient ID
+matched$PT_ID <- c(1:dim(matched)[1])
+
+head(matched)
+rm(x,y)
+```
+
+# 11. Filter the expression set and metadata for matched samples only. Use these matched samples in DEA. 
+
+```{r}
+# filter metadata
+#get factors of interest for samples that have paired samples. #i.e only GEO accessions that appear in x3. 
+matched_eset_metadata <- combined_eset_metadata %>% filter(geo_accession %in% c(matched$geo_accession.x, matched$geo_accession.y))
+
+
+#now join on PT_IDs to the correct accessions. 
+#two left joins to make sure PTIDs are joined to the right samples.
+matched_eset_metadata <- matched_eset_metadata %>% left_join(matched[,c("geo_accession.x", "PT_ID")], by = join_by(geo_accession == geo_accession.x)) %>% left_join(matched[,c("geo_accession.y", "PT_ID")], by = join_by(geo_accession == geo_accession.y))
+
+matched_eset_metadata[is.na(matched_eset_metadata)] <- ""  #replace NAs with blanks
+
+matched_eset_metadata$PT_ID <- paste(matched_eset_metadata$PT_ID.x, matched_eset_metadata$PT_ID.y) #merge the PT_ID.x and PT_ID.y columns into a new column, PT_ID. 
+
+matched_eset_metadata$PT_ID <- as.numeric(matched_eset_metadata$PT_ID)
+
+matched_eset_metadata <- matched_eset_metadata %>% dplyr::select(-PT_ID.x, - PT_ID.y) #remove PT_ID.x and PT_ID.y
+
+
+
+# filter eset
+#filter combined_eset to have only the matched samples
+matched_eset <- combined_eset[, c(colnames(combined_eset) %in% matched_eset_metadata$geo_accession)] #41000 178 #contains control probes.
+
+
+rm(matched)
+```
+
+
+# 12. Filter probes with low variance across all samples 
+If which(is.na(x)) returns integer(0) - means there aren't any NA values in the exp data.
+
+"It is known that genes corresponding to either low values of mean expression or to low values of variance of expression are more likely to be non-informative" [PMID: 23510016]. 
+But this person on biostars forum says it is better NOT to filter before using limma (https://www.biostars.org/p/153519/)
+and Gordon Smyth says to try plotSA function from limma to see if more filtering is needed (https://support.bioconductor.org/p/98635/)
+
+
+```{r}
+# filter out low variance probes - this is probes with little change across ALL samples. 
+
+#for all samples
+combined_eset_filt <- varFilter(combined_eset, var.func=IQR, var.cutoff=0.5, filterByQuantile=TRUE) #default is 50% of probes filtered
+
+#for matched samples only
+matched_eset_filt <- varFilter(matched_eset, var.func=IQR, var.cutoff=0.5, filterByQuantile=TRUE) #default is 50% of probes filtered
+
+```
+
+
+# 13. Batch Correction using ComBat
+Correct according to scan date. 
+
+A. Batch correction of combined data. Not sure if neccessary to do batch correction of baseline and on-treatment samples separately. Think it would be bad to do one procedure multiple times based on same batch correction parameter of scandate. 
+
+Change "matched_eset_filt" to "combined_eset_filt" if I want to look at all 199 samples. 
+
+
+```{r}
+### PCA BEFORE BATCH CORRECTION
+
+# matched_pca_proc<- prcomp(t(matched_eset_filt)) #should I replace with filtered one - no control probes etc? 
+# 
+# #calculate PC1 and PC2.
+# matched_pcvalue1 = round(100*matched_pca_proc$sdev[1]^2/(sum(matched_pca_proc$sdev^2)),1)
+# matched_pcvalue2 = round(100*matched_pca_proc$sdev[2]^2/(sum(matched_pca_proc$sdev^2)),1)
+# 
+# #need long format eset for ggplot graphs
+# ggplot_matched_eset <- melt(matched_eset_filt) 
+# 
+# 
+# #make a dataframe with PC1/2 values, metadata from eset, left-join to get sample types. 
+# PC1_2_matched_meta <- data.frame(PC1 = matched_pca_proc$x[,1], PC2 = matched_pca_proc$x[,2], geo_accession = unique(ggplot_matched_eset$Var2)) #var2 is geo accessions
+# PC1_2_matched_meta <- left_join(PC1_2_matched_meta, matched_eset_metadata %>% dplyr::select(geo_accession, sample_type, drug_response, er_status, pr_status, treatment_group,scandate), by = "geo_accession")
+# 
+# #PCA plot to look at variance between samples
+# PC1_2_matched_eset_plot <- ggplot(data = PC1_2_matched_meta) + 
+#   geom_point(mapping = aes(x = PC1, 
+#                            y = PC2,
+#                            color = scandate,#sample_type
+#                            shape = sample_type), #drug response
+#              size = 4, 
+#              alpha = 0.5) + 
+#   labs(x=paste0("PC1 (",matched_pcvalue1,"%)"), y=paste0("PC2 (",matched_pcvalue2,"%)"), size = 5)
+# 
+# #PC1_2_matched_eset_plot
+# 
+# #png(file="PC1_2_matched_eset.png", width=30*pcvalue1, height=30*pcvalue2, units="px")
+# #PC1_2_matched_eset_plot
+# #dev.off()
+
+
+
+## BATCH CORRECTION
+
+# specify factors that cause variation we want to **keep**.
+mod <- model.matrix(~as.factor(sample_type) + as.factor(treatment_group) + as.factor(drug_response), data = matched_eset_metadata)  #If I used this in the batch correction itself, ComBat would also adjust for sampletype, treatment group, and drug response.
+
+mod0 <- model.matrix(~1, data = matched_eset_metadata) #null model
+
+
+#assessing pvalues, q values and F-stats from uncorrected data using the same models for batch correction from above as it is still the same data structure, just different numbers.
+pValues_uncorrected <- f.pvalue(matched_eset_filt, mod, mod0)
+qValues_uncorrected <- p.adjust(pValues_uncorrected, method="BH") #note BH being used here
+fstatistics_uncorrected <- fstats(matched_eset_filt, mod, mod0)
+
+
+# Back to batch correction
+batch <- matched_eset_metadata$scandate  #identify the batches
+
+modcombat <- model.matrix(~1, data=matched_eset_metadata) # Only want to adjust by batch so just put ~1 for the intercept in the model
+
+
+#Perform batch correction
+batch_corrected_matched_eset <- ComBat(dat=matched_eset_filt, batch=batch, mod=modcombat, par.prior = T, prior.plots = F) 
+
+
+# Get raw and adjusted p-values for linear model using batch-corrected data
+pValuesCombat <- f.pvalue(batch_corrected_matched_eset, mod, mod0)
+qValuesCombat <- p.adjust(pValuesCombat, method="BH") #note BH used here
+fstatistics <- fstats(batch_corrected_matched_eset, mod, mod0)
+
+
+# ## PCA AFTER BATCH CORRECTION
+# BC_matched_pca_proc<- prcomp(t(batch_corrected_matched_eset)) #should I replace with filtered one - no control probes etc? 
+# 
+# #calculate PC1 and PC2.
+# BC_matched_pcvalue1 = round(100*BC_matched_pca_proc$sdev[1]^2/(sum(BC_matched_pca_proc$sdev^2)),1)
+# BC_matched_pcvalue2 = round(100*BC_matched_pca_proc$sdev[2]^2/(sum(BC_matched_pca_proc$sdev^2)),1)
+# 
+# #need long format eset for ggplot graphs
+# ggplot_BC_matched_eset <- melt(batch_corrected_matched_eset) 
+# 
+# #make a dataframe with PC1/2 values, metadata from eset, left-join to get sample types. 
+# PC1_2_BC_matched_meta <- data.frame(PC1 = BC_matched_pca_proc$x[,1], PC2 = BC_matched_pca_proc$x[,2], geo_accession = unique(ggplot_BC_matched_eset$Var2))
+# PC1_2_BC_matched_meta <- left_join(PC1_2_BC_matched_meta, matched_eset_metadata %>% dplyr::select(geo_accession, sample_type, drug_response, er_status, pr_status, treatment_group, scandate), by = "geo_accession")
+# 
+# #PCA plot to look at variance between samples
+# PC1_2_BC_matched_eset_plot <- ggplot(data = PC1_2_BC_matched_meta) + 
+#   geom_point(mapping = aes(x = PC1, 
+#                            y = PC2,
+#                            color = scandate,  #sample_type
+#                            shape = sample_type), #drug_response
+#              size = 4, 
+#              alpha = 0.5) + 
+#   labs(x=paste0("PC1 (",BC_matched_pcvalue1,"%)"), y=paste0("PC2 (",BC_matched_pcvalue2,"%)"), size = 5)
+# 
+# #PC1_2_BC_matched_eset_plot
+
+
+
+
+# ## matched samples only (n = 178)
+# PC1_2_matched_eset_plot    # PCA of uncorrected data
+# PC1_2_BC_matched_eset_plot # and of batch corrected data
+# #0.1% diffeence between PC1s and PC2s
+# 
+# hist(pValues_uncorrected)   # distribution of p-values for uncorrected data
+# hist(pValuesCombat)         # and for corrected data
+# 
+# #library(car)
+# qqPlot(fstatistics_uncorrected) # QQ-plot to examine distribution of Fstats for uncorrected data
+# qqPlot(fstatistics)             # and corrected data
+# 
+
+
+#remove uneeded objects when done
+# rm(matched_pca_proc, matched_pcvalue1, matched_pcvalue2, ggplot_matched_eset, PC1_2_matched_meta,
+#    BC_matched_pca_proc, BC_matched_pcvalue1, BC_matched_pcvalue2, ggplot_BC_matched_eset, PC1_2_BC_matched_meta,
+#    mod, mod0, modcombat, batch)
+
+```
+
+Based on PCA plots before and after ComBat, it looks like there isn't much of a batch effect. Can batch effects be quantified? 
+Potentially, using gPCA. 
+
+B.  gPCA to detect batch effects
+
+```{r}
+#use gPCA to test for a batch effect (SCANDATE)
+library(gPCA)
+
+
+#DO gPCA WITH NO BATCH CORRECTION PERFORMED. 
+out<-gPCA.batchdetect(x=t(matched_eset_filt),batch=matched_eset_metadata$scandate,center=FALSE, scaleY=TRUE,filt=NULL,nperm=1000,seed=NULL) # need samples x probes so transpose eset. scaleY accounts for unbalanced design
+out$delta #0.0002212997 for combined_eset
+          #0.0002474559 for matched_eset
+
+out$p.val #"<0.001" for combined_eset
+          #"<0.001" for matched_eset
+
+
+((out$varPCg1-out$varPCu1)/out$varPCg1)*100 #calculate percentage of variation cause by batch effect (scandate) - -212.75 for combined_eset
+                                                                                                                #-220.3394 for matched_eset
+
+
+# ggplot of unguided PCA
+ggplot_matched_eset <- melt(matched_eset_filt) 
+PCu1_2_matched_meta <- data.frame(PC1 = out$PCu[,1], PC2 =  out$PCu[,2], geo_accession = unique(ggplot_matched_eset$Var2))
+PCu1_2_matched_meta <- left_join(PCu1_2_matched_meta, matched_eset_metadata %>% dplyr::select(geo_accession, sample_type, drug_response, er_status, pr_status, treatment_group,scandate), by = "geo_accession")
+
+PCu1_2_matched_eset_plot <- ggplot(data = PCu1_2_matched_meta) + 
+  geom_point(mapping = aes(x = PC1, 
+                           y = PC2,
+                           color = scandate,#sample_type
+                           shape = sample_type), #drug response
+             size = 4, 
+             alpha = 0.5) + 
+  labs(x=paste0("PCu1"), y=paste0("PCu2"), size = 5)
+
+
+# ggplot of guided PCA
+ggplot_matched_eset <- melt(matched_eset_filt) 
+PCg1_2_matched_meta <- data.frame(PC1 = out$PCg[,1], PC2 =  out$PCg[,2], geo_accession = unique(ggplot_matched_eset$Var2))
+PCg1_2_matched_meta <- left_join(PCg1_2_matched_meta, matched_eset_metadata %>% dplyr::select(geo_accession, sample_type, drug_response, er_status, pr_status, treatment_group,scandate), by = "geo_accession")
+
+#PCA plot to look at variance between samples
+PCg1_2_matched_eset_plot <- ggplot(data = PCg1_2_matched_meta) + 
+  geom_point(mapping = aes(x = PC1, 
+                           y = PC2,
+                           color = scandate,#sample_type
+                           shape = sample_type), #drug response
+             size = 4, 
+             alpha = 0.5) + 
+  labs(x=paste0("PCg1"), y=paste0("PCg2"), size = 5)
+
+
+
+#DO gPCA WITH BATCH CORRECTION PERFORMED. 
+out2<-gPCA.batchdetect(x=t(batch_corrected_matched_eset),batch=matched_eset_metadata$scandate,center=FALSE, scaleY=TRUE,filt=NULL,nperm=1000,seed=NULL) # need samples x probes so transpose eset. scaleY accounts for unbalanced design
+
+out2$delta #0.0002500308 for combined_eset
+           #0.0002546056 for matched_eset
+
+out2$p.val #"<0.001" for combined_eset
+           #"<0.001" for matched_eset
+
+
+((out2$varPCg1-out2$varPCu1)/out2$varPCg1)*100 # calculate percentage of variation cause by batch effect (scandate) -198.6248 for combined_eset
+                                                                                                                  # -210.9501 for matched_eset
+
+
+# ggplot of unguided PCA w/ BC data
+ggplot_BC_matched_eset <- melt(batch_corrected_matched_eset) 
+PCu1_2_matched_meta <- data.frame(PC1 = out2$PCu[,1], PC2 =  out2$PCu[,2], geo_accession = unique(ggplot_BC_matched_eset$Var2))
+PCu1_2_matched_meta <- left_join(PCu1_2_matched_meta, matched_eset_metadata %>% dplyr::select(geo_accession, sample_type, drug_response, er_status, pr_status, treatment_group,scandate), by = "geo_accession")
+
+PCu1_2_BC_matched_eset_plot <- ggplot(data = PCu1_2_matched_meta) + 
+  geom_point(mapping = aes(x = PC1, 
+                           y = PC2,
+                           color = scandate,#sample_type
+                           shape = sample_type), #drug response
+             size = 4, 
+             alpha = 0.5) + 
+  labs(x=paste0("PCu1"), y=paste0("PCu2"), size = 5)
+
+
+# ggplot of guided PCA w/ BC data
+ggplot_BC_matched_eset <- melt(batch_corrected_matched_eset)
+PCg1_2_matched_meta <- data.frame(PC1 = out2$PCg[,1], PC2 =  out2$PCg[,2], geo_accession = unique(ggplot_BC_matched_eset$Var2))
+PCg1_2_matched_meta <- left_join(PCg1_2_matched_meta, matched_eset_metadata %>% dplyr::select(geo_accession, sample_type, drug_response, er_status, pr_status, treatment_group,scandate), by = "geo_accession")
+
+#PCA plot to look at variance between samples
+PCg1_2_BC_matched_eset_plot <- ggplot(data = PCg1_2_matched_meta) + 
+  geom_point(mapping = aes(x = PC1, 
+                           y = PC2,
+                           color = scandate,#sample_type
+                           shape = sample_type), #drug response
+             size = 4, 
+             alpha = 0.5) + 
+  labs(x=paste0("PCg1"), y=paste0("PCg2"), size = 5)
+
+
+### View plots when combined_eset was used
+#PCu1_2_combined_eset  # unguided PCA with uncorrected data
+#PCg1_2_combined_eset  # guided PCA with uncorrected data
+
+#PCu1_2_BC_combined_eset   # unguided PCA with batch-corrected data
+#PCg1_2_BC_combined_eset   # guided PCA with batch-corrected data
+
+
+### View plots when matched_eset was used 
+PCu1_2_matched_eset_plot  # unguided PCA with uncorrected data
+PCg1_2_matched_eset_plot  # guided PCA with uncorrected data
+
+PCu1_2_BC_matched_eset_plot   # unguided PCA with batch-corrected data
+PCg1_2_BC_matched_eset_plot   # guided PCA with batch-corrected data
+
+#Comparing matched_eset non-batch corrected vs batch corrected guided PCAs - batch correction does seem to shift data a fair bit 
+
+#Comparing  PCAs from batch corrected combined vs matched esets -- unguided PCAs look similar enough, there is a shift when looking at guided PCAs. 
+
+
+#rm(ggplot_matched_eset, ggplot_BC_matched_eset, PCg1_2_matched_meta, PCu1_2_matched_meta)
+
+```
+
+
+
+# 14. Annotation #
+```{r}
+require(biomaRt)
+
+ensembl <- useMart('ensembl', dataset = 'hsapiens_gene_ensembl')
+listAttributes(ensembl)[grep('agilent', tolower(listAttributes(ensembl)[,1])),]  #pick the relevant option from this list
+
+#get list of the microarray probes
+probes <- rownames(matched_eset_filt)
+
+annot <- getBM(
+  attributes = c('agilent_wholegenome',   #think it is the wholegenome option (https://www.agilent.com/en/human-gene-expression-microarrays-details-specifications) - search product number G4112F
+    'entrezgene_id',
+    "hgnc_symbol"), #new added line
+  filters = 'agilent_wholegenome',
+  values = probes,  #change to experimental_probes
+  mart = ensembl,
+  uniqueRows = TRUE)
+
+annot <- merge(
+  x = as.data.frame(probes),
+  y =  annot,
+  by.y = 'agilent_wholegenome',
+  all.x = T,
+  by.x = 'probes')
+
+
+#dim(annot) # 23071     3
+
+```
+
+
+# X.  Removing duplicates from annotations. 
+See annotation_struggles.Rmd
+```{r}
+#put finished code here
+```
+

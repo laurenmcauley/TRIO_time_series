@@ -1,0 +1,1616 @@
+---
+title: "Untitled"
+output: html_document
+date: "2023-03-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## **Background** ##
+In TRIO_B07_preprocessing_combined.Rmd, microarray data was background corrected, normalised, and control probes were removed. Replicate probes were averaged. Then, matched samples were identified. Focusing on these matched samples, genes with low variance across all samples were removed **(matched_eset_filt, see section 12 in TRIO_B07_preprocessing_combined.Rmd)**. Batch correction was performed using ComBat **(batch_corrected_matched_eset, see section 13 in TRIO_B07_preprocessing_combined.Rmd)**. Now, differential expression analysis will be done using limma. This file focuses on differential expression between response types. 
+
+See example design matrices: PMID: 33604029.
+
+
+
+## **What's in this file?** ##
+1. Make a replicate of matched_eset_metadata for use in limma 
+2. Limma with NO batch correction at all
+3. Using limma design matrix to account for batch effects. 
+4. Using ComBat-corrected data in limma. 
+5. Make a table comparing DEGs identified across batch correction variations. 
+6. What genes were identified by all models?
+
+
+
+# OUTLINE OF MODELS 
+There are several covariates of interest; response, timepoint (baseline vs on treatment), treatment received, ER status, and PR status. The following models will be considered; 
+A. ~0 + RESP_TIME
+B. ~0 + RESP_TIME + TREATMENT
+C. ~0 + RESP_TIME + TREATMENT + ER_STATUS + PR_STATUS
+
+These will be repeated for the three batch-correction methods; no batch correction (noBC), limma batch correction (limBC), and ComBat batch correction (ComBat).
+
+Each model will have it's own chunk of code. Five comparisons will be made using each model; 
+1. All pCR vs all RD 
+2. pCR On-treatment vs Baseline
+3. RD On-treatment vs Baseline
+4. Baseline pCR vs baseline RD
+5. On-treatment pCR vs on-treatment RD
+
+
+
+
+### **1. Make a replicate of matched_eset_metadata that I can alter for use in limma**
+Taking relevant columns from metadata and altering them to use as factors in limma design matrix. 
+
+```{r}
+
+#make a replicate called mypch for use in limma
+mypch <- matched_eset_metadata %>% dplyr::select(geo_accession, sample_type, treatment_group, drug_response, scandate, PT_ID, er_status, pr_status)
+
+#merge treatment group and response factors into one new factor - combining factors reduces degrees of freedom needed in analysis? 
+mypch$treatmentgroup_response <- paste(mypch$treatment_group, mypch$drug_response, sep = "_")
+
+#cleaning mypch up a bit
+mypch <- mypch %>% dplyr::select(PT_ID, everything()) #move PT_ID column to the front
+mypch <-mypch %>% dplyr::select(-scandate, scandate) # put scandate column last
+
+#change long sample type categories to shortened versions
+mypch$sample_type <- sub("Breast tumor baseline", "BASELINE",
+                     sub("after 2-weeks of treatments with HER2-targeted therapy", "ON_TREATMENT", mypch$sample_type))
+
+
+PT <- factor(mypch$PT_ID) #account for paired samples
+RESPONSE <- factor(mypch$drug_response, levels = c("RD", "PCR"))
+TIMEPOINT <- factor(mypch$sample_type, levels = c("BASELINE", "ON_TREATMENT"))
+TREATMENT <- factor(mypch$treatment_group, levels = c("TCHTy", "TCH", "TCTy"))
+ER_STATUS <- factor(mypch$er_status, levels = c("Pos", "Neg"))
+PR_STATUS <- factor(mypch$pr_status, levels = c("Pos", "Neg"))
+
+#merge response and timepoint
+RESP_TIME <- paste(mypch$drug_response,mypch$sample_type, sep = "_")  #grouping 2 factors together when possible
+
+```
+
+
+
+### **2. Limma with NO batch correction at all ** 
+
+# A. ~0 + RESP_TIME
+```{r}
+#make the design 
+broad_design_noBC <- model.matrix(~0 + RESP_TIME) #four columns of interest - PCR baseline/on-treatment, RD baseline/on-treatment. NO SCAN DATE.  #this accounts for drug_response, and sample_type
+colnames(broad_design_noBC) <- sub("RESP_TIME", "",
+                               sub("TREATMENTT", "T", 
+                              gsub("-", "", colnames(broad_design_noBC))))
+
+
+ncol(broad_design_noBC)  #4
+qr(broad_design_noBC)$rank #4
+
+
+#Test to see if sample matchings should be included in the model as a blocking variable 
+#Check if PT_ID is correlated to the expression data. 
+#broad_cor_noBC <- duplicateCorrelation(matched_eset_filt, broad_design_noBC, block=PT)
+#broad_cor_noBC$consensus.correlation #-0.297-- negative correlation means remove the blocking variable 
+
+broad_fit_noBC <- lmFit(object=matched_eset_filt, design=broad_design_noBC, block= NULL , correlation=NULL) #no blocking variable
+#View(broad_fit[["coefficients"]]) #this mixed effects model estimates MEAN GENE EXPRESSION of each group
+
+#View(broad_fit[["coefficients"]][,1]) #mean gene expression for patients at who exp pCR at baseline 
+
+
+#now compare the groups using a contrast matrix 
+broad_contrasts_noBC <- makeContrasts(
+  #Q1: Any overall differences between PCR and RD? 
+  PCRvRD = (PCR_ON_TREATMENT - PCR_BASELINE) - (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q2: What differences between baseline and on-treatment in all pts who experienced PCR? 
+  PCR_OTvB = (PCR_ON_TREATMENT - PCR_BASELINE),
+  
+  #Q3: What differences between baseline and on-treatment in all pts who had RD? 
+  RD_OTvB = (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q4: Any baseline differences between pts who later experience RD or PCR?
+  PCRvRD_B = (PCR_BASELINE - RD_BASELINE),
+  
+  #Q5: Any differences during treatment between pts who later experience RD or PCR?
+  PCRvRD_OT = (PCR_ON_TREATMENT - RD_ON_TREATMENT),
+  levels = colnames(broad_design_noBC))
+
+
+#View(broad_contrasts_noBC)
+
+#now fit the model
+broad_fit_noBC <- contrasts.fit(broad_fit_noBC, broad_contrasts_noBC) #
+
+
+#compute moderated t-stat, F-stat, and log-odds of differential expression for each gene
+broad_noBC_top0 <-  eBayes(broad_fit_noBC) #fit empirical Bayes model
+
+
+#Q1: Any overall differences between PCR and RD? 
+broad_noBC_top1a<- topTable(broad_noBC_top0, coef='PCRvRD',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_noBC_top1asig <- broad_noBC_top1a %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) 
+
+
+#Q2: What differences between baseline and on-treatment in all pts who experienced pCR? 
+broad_noBC_top2a<- topTable(broad_noBC_top0, coef='PCR_OTvB',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P')
+broad_noBC_top2asig<-broad_noBC_top2a %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) 
+
+
+#Q3: What differences between baseline and on-treatment in all pts who had RD? 
+broad_noBC_top3a<- topTable(broad_noBC_top0, coef='RD_OTvB',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_noBC_top3asig<-broad_noBC_top3a %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) 
+
+
+#Q4: Any baseline differences between pts who later experience RD or PCR?
+broad_noBC_top4a<- topTable(broad_noBC_top0, coef='PCRvRD_B',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_noBC_top4asig<- broad_noBC_top4a %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+
+
+#Q5: Any differences during treatment between pts who later experience RD or PCR?
+broad_noBC_top5a<- topTable(broad_noBC_top0, coef='PCRvRD_OT',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_noBC_top5asig <- broad_noBC_top5a %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+
+```
+
+
+# B. ~0 + RESPTIME + TREATMENT
+```{r}
+
+#make the design 
+broad_design_noBC <- model.matrix(~0 + RESP_TIME + TREATMENT) #four columns of interest - PCR baseline/on-treatment, RD baseline/on-treatment. NO SCAN DATE.  #this accounts for drug_response, and sample_type
+colnames(broad_design_noBC) <- sub("RESP_TIME", "",
+                               sub("TREATMENTT", "T", 
+                              gsub("-", "", colnames(broad_design_noBC))))
+
+broad_fit_noBC <- lmFit(object=matched_eset_filt, design=broad_design_noBC, block= NULL , correlation=NULL)
+
+#now compare the groups using a contrast matrix 
+broad_contrasts_noBC <- makeContrasts(
+  #Q1: Any overall differences between PCR and RD? 
+  PCRvRD = (PCR_ON_TREATMENT - PCR_BASELINE) - (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q2: What differences between baseline and on-treatment in all pts who experienced PCR? 
+  PCR_OTvB = (PCR_ON_TREATMENT - PCR_BASELINE),
+  
+  #Q3: What differences between baseline and on-treatment in all pts who had RD? 
+  RD_OTvB = (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q4: Any baseline differences between pts who later experience RD or PCR?
+  PCRvRD_B = (PCR_BASELINE - RD_BASELINE),
+  
+  #Q5: Any differences during treatment between pts who later experience RD or PCR?
+  PCRvRD_OT = (PCR_ON_TREATMENT - RD_ON_TREATMENT),
+  levels = colnames(broad_design_noBC))
+
+broad_fit_noBC <- contrasts.fit(broad_fit_noBC, broad_contrasts_noBC)
+
+broad_noBC_top0 <-  eBayes(broad_fit_noBC) 
+
+
+#Q1: Any overall differences between PCR and RD? 
+broad_noBC_top1b<- topTable(broad_noBC_top0, coef='PCRvRD',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_noBC_top1bsig <- broad_noBC_top1b %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+
+
+#Q2: What differences between baseline and on-treatment in all pts who experienced pCR? 
+broad_noBC_top2b<- topTable(broad_noBC_top0, coef='PCR_OTvB',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P')
+broad_noBC_top2bsig <-broad_noBC_top2b %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+
+
+#Q3: What differences between baseline and on-treatment in all pts who had RD? 
+broad_noBC_top3b<- topTable(broad_noBC_top0, coef='RD_OTvB',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_noBC_top3bsig <-broad_noBC_top3b %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+
+
+#Q4: Any baseline differences between pts who later experience RD or PCR?
+broad_noBC_top4b<- topTable(broad_noBC_top0, coef='PCRvRD_B',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_noBC_top4bsig<- broad_noBC_top4b %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+
+
+#Q5: Any differences during treatment between pts who later experience RD or PCR?
+broad_noBC_top5b<- topTable(broad_noBC_top0, coef='PCRvRD_OT',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_noBC_top5bsig <- broad_noBC_top5b %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+```
+
+
+# C. ~0 + RESPTIME + TREATMENT + ER_STATUS + PR_STATUS
+```{r}
+
+#make the design 
+broad_design_noBC <- model.matrix(~0 + RESP_TIME + TREATMENT + ER_STATUS + PR_STATUS) #four columns of interest - PCR baseline/on-treatment, RD baseline/on-treatment. NO SCAN DATE.  #this accounts for drug_response, and sample_type
+colnames(broad_design_noBC) <- sub("RESP_TIME", "",
+                               sub("TREATMENTT", "T", 
+                              gsub("-", "", colnames(broad_design_noBC))))
+
+broad_fit_noBC <- lmFit(object=matched_eset_filt, design=broad_design_noBC, block= NULL , correlation=NULL)
+
+#now compare the groups using a contrast matrix 
+broad_contrasts_noBC <- makeContrasts(
+  #Q1: Any overall differences between PCR and RD? 
+  PCRvRD = (PCR_ON_TREATMENT - PCR_BASELINE) - (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q2: What differences between baseline and on-treatment in all pts who experienced PCR? 
+  PCR_OTvB = (PCR_ON_TREATMENT - PCR_BASELINE),
+  
+  #Q3: What differences between baseline and on-treatment in all pts who had RD? 
+  RD_OTvB = (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q4: Any baseline differences between pts who later experience RD or PCR?
+  PCRvRD_B = (PCR_BASELINE - RD_BASELINE),
+  
+  #Q5: Any differences during treatment between pts who later experience RD or PCR?
+  PCRvRD_OT = (PCR_ON_TREATMENT - RD_ON_TREATMENT),
+  levels = colnames(broad_design_noBC))
+
+broad_fit_noBC <- contrasts.fit(broad_fit_noBC, broad_contrasts_noBC)
+
+broad_noBC_top0 <-  eBayes(broad_fit_noBC) 
+
+
+#Q1: Any overall differences between PCR and RD? 
+broad_noBC_top1c<- topTable(broad_noBC_top0, coef='PCRvRD',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_noBC_top1csig <- broad_noBC_top1c %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+
+
+#Q2: What differences between baseline and on-treatment in all pts who experienced pCR? 
+broad_noBC_top2c<- topTable(broad_noBC_top0, coef='PCR_OTvB',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P')
+broad_noBC_top2csig<-broad_noBC_top2c%>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+
+
+#Q3: What differences between baseline and on-treatment in all pts who had RD? 
+broad_noBC_top3c<- topTable(broad_noBC_top0, coef='RD_OTvB',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_noBC_top3csig<-broad_noBC_top3c %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+
+
+#Q4: Any baseline differences between pts who later experience RD or PCR?
+broad_noBC_top4c<- topTable(broad_noBC_top0, coef='PCRvRD_B',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_noBC_top4csig<- broad_noBC_top4c %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+
+
+#Q5: Any differences during treatment between pts who later experience RD or PCR?
+broad_noBC_top5c<- topTable(broad_noBC_top0, coef='PCRvRD_OT',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_noBC_top5csig <- broad_noBC_top5c %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+```
+
+#How many DE probes did each model identify for data that was NOT batch corrected at all?
+```{r}
+dim(broad_noBC_top1asig)[1]
+
+dim(broad_noBC_top1bsig)[1]
+
+dim(broad_noBC_top1csig)[1]
+
+dim(broad_noBC_top2asig)[1]
+
+dim(broad_noBC_top2bsig)[1]
+
+dim(broad_noBC_top2csig)[1]
+
+dim(broad_noBC_top3asig)[1]
+
+dim(broad_noBC_top3bsig)[1]
+
+dim(broad_noBC_top3csig)[1]
+
+dim(broad_noBC_top4asig)[1]
+
+dim(broad_noBC_top4bsig)[1]
+
+dim(broad_noBC_top4csig)[1]
+
+dim(broad_noBC_top5asig)[1]
+
+dim(broad_noBC_top5bsig)[1]
+
+dim(broad_noBC_top5csig)[1]
+
+```
+
+
+# Some plots for those models.
+```{r}
+
+# # volcano plot for noBC,  comparison 2 (pCR OTvB), model A (~0 + RESP_TIME),
+# plot(broad_noBC_top2a$logFC,-log10(broad_noBC_top2a$adj.P.Val), main="DEGs in pts who had pCR (baseline vs on-treatment)", xlab="log2(pCR_OT/pCR_B)", ylab="-log10(adj P value)",xlim = c(-4,7), ylim = c(0,80))
+# text(-3, 70, label = "Downreg when OT", cex = 1.5)  #constrast made is on-treatment - baseline. So this is looking at DE relative to on-treatment samples.
+# text(3, 70, label = "Upregulated when OT", cex = 1.5)
+# abline(v=1.5, col="red")
+# abline(v= -1.5, col="red")
+# abline(h=1.3, col="green")
+#
+#
+# #comparing across covariate adjustments
+# # Between the three model types for comparison 2 - pCR OTvB, 
+# list_venn <- list(noBC_RESPTIME = rownames(broad_noBC_top2asig),
+#                   noBC_RESPTIME_T= rownames(broad_noBC_top2bsig),
+#                   noBC_RESPTIME_T_EP = rownames(broad_noBC_top2csig))
+# ggvenn(list_venn, c("noBC_RESPTIME", "noBC_RESPTIME_T","noBC_RESPTIME_T_EP"))
+# 
+# 
+# # Between comparisons 1,2, and 3
+# list_venn <- list(PCR_OTvB = rownames(broad_noBC_top2asig),
+#                   RD_OTvB = rownames(broad_noBC_top3asig),
+#                   PCRvRD_overall = rownames(broad_noBC_top1asig))
+# ggvenn(list_venn, c("PCR_OTvB", "RD_OTvB","PCRvRD_overall"))
+
+```
+
+
+
+
+### **3. Using limma design matrix to account for batch effects.**
+Batch is incorporated into the design matrix by including SD in the model.matrix function. 
+
+# A. ~0 + RESP_TIME + SD
+```{r}
+
+#make the design 
+broad_design_limBC <- model.matrix(~0 + RESP_TIME + SD)#four columns of interest - PCR baseline/on-treatment, RD baseline/on-treatment. INCLUDES SCAN DATE.  #this accounts for drug_response, and sample_type
+colnames(broad_design_limBC) <- sub("RESP_TIME", "",
+                               sub("TREATMENTT", "T", 
+                              gsub("-", "", colnames(broad_design_limBC))))
+
+
+ncol(broad_design_limBC)  #25
+qr(broad_design_limBC)$rank #25
+
+#Test to see if sample matchings should be included in the model as a blocking variable
+#Check if PT_ID is correlated to the expression data. 
+#broad_cor <- duplicateCorrelation(matched_eset_filt, broad_design_limBC, block=PT)
+#broad_cor$consensus.correlation #-0.370-- negative correlation means remove the blocking variable 
+
+broad_fit_limBC <- lmFit(object=matched_eset_filt, design=broad_design_limBC, block= NULL , correlation=NULL) #no blocking variable
+#View(broad_fit[["coefficients"]]) #this mixed effects model estimates MEAN GENE EXPRESSION of each group
+
+#View(broad_fit[["coefficients"]][,1]) #mean gene expression for patients at who exp pCR at baseline 
+
+
+#now compare the groups using a contrast matrix 
+broad_contrasts_limBC <- makeContrasts(
+  #Q1: Any overall differences between PCR and RD? 
+  PCRvRD = (PCR_ON_TREATMENT - PCR_BASELINE) - (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q2: What differences between baseline and on-treatment in all pts who experienced PCR? 
+  PCR_OTvB = (PCR_ON_TREATMENT - PCR_BASELINE),
+  
+  #Q3: What differences between baseline and on-treatment in all pts who had RD? 
+  RD_OTvB = (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q4: Any baseline differences between pts who later experience RD or PCR?
+  PCRvRD_B = (PCR_BASELINE - RD_BASELINE),
+  
+  #Q5: Any differences during treatment between pts who later experience RD or PCR?
+  PCRvRD_OT = (PCR_ON_TREATMENT - RD_ON_TREATMENT),
+  levels = colnames(broad_design_limBC))
+  
+#View(broad_contrasts_limBC)
+
+#now fit the model
+broad_fit_limBC <- contrasts.fit(broad_fit_limBC, broad_contrasts_limBC) #
+
+
+#compute moderated t-stat, F-stat, and log-odds of differential expression for each gene
+broad_limBC_top0 <-  eBayes(broad_fit_limBC) #fit empirical Bayes model
+
+
+
+
+#Q1: Any overall differences between PCR and RD? 
+broad_limBC_top1a<- topTable(broad_limBC_top0, coef='PCRvRD',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_limBC_top1asig <- broad_limBC_top1a %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 1 DE probes
+
+
+#Q2: What differences between baseline and on-treatment in all pts who experienced pCR? 
+broad_limBC_top2a<- topTable(broad_limBC_top0, coef='PCR_OTvB',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P')
+broad_limBC_top2asig<-broad_limBC_top2a %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 374 DE probes
+
+
+#Q3: What differences between baseline and on-treatment in all pts who had RD? 
+broad_limBC_top3a<- topTable(broad_limBC_top0, coef='RD_OTvB',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_limBC_top3asig<-broad_limBC_top3a %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 387 DE probes
+
+
+#Q4: Any baseline differences between pts who later experience RD or PCR?
+broad_limBC_top4a<- topTable(broad_limBC_top0, coef='PCRvRD_B',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_limBC_top4asig<- broad_limBC_top4a %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) #1 DE probe
+
+
+#Q5: Any differences during treatment between pts who later experience RD or PCR?
+broad_limBC_top5a<- topTable(broad_limBC_top0, coef='PCRvRD_OT',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_limBC_top5asig <- broad_limBC_top5a %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+
+```
+
+# B. ~0+ RESPTIME + TREATMENT + SD
+```{r}
+
+#make the design 
+broad_design_limBC <- model.matrix(~0 + RESP_TIME + TREATMENT + SD)#four columns of interest - PCR baseline/on-treatment, RD baseline/on-treatment. INCLUDES SCAN DATE.  #this accounts for drug_response, and sample_type
+colnames(broad_design_limBC) <- sub("RESP_TIME", "",
+                               sub("TREATMENTT", "T", 
+                              gsub("-", "", colnames(broad_design_limBC))))
+
+broad_fit_limBC <- lmFit(object=matched_eset_filt, design=broad_design_limBC, block= NULL , correlation=NULL) #no blocking variable as per previous chunk
+
+#now compare the groups using a contrast matrix 
+broad_contrasts_limBC <- makeContrasts(
+  #Q1: Any overall differences between PCR and RD? 
+  PCRvRD = (PCR_ON_TREATMENT - PCR_BASELINE) - (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q2: What differences between baseline and on-treatment in all pts who experienced PCR? 
+  PCR_OTvB = (PCR_ON_TREATMENT - PCR_BASELINE),
+  
+  #Q3: What differences between baseline and on-treatment in all pts who had RD? 
+  RD_OTvB = (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q4: Any baseline differences between pts who later experience RD or PCR?
+  PCRvRD_B = (PCR_BASELINE - RD_BASELINE),
+  
+  #Q5: Any differences during treatment between pts who later experience RD or PCR?
+  PCRvRD_OT = (PCR_ON_TREATMENT - RD_ON_TREATMENT),
+  levels = colnames(broad_design_limBC))
+  
+broad_fit_limBC <- contrasts.fit(broad_fit_limBC, broad_contrasts_limBC) #
+
+broad_limBC_top0 <-  eBayes(broad_fit_limBC) #fit empirical Bayes model
+
+
+
+#Q1: Any overall differences between PCR and RD? 
+broad_limBC_top1b<- topTable(broad_limBC_top0, coef='PCRvRD',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_limBC_top1bsig <- broad_limBC_top1b %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 1 DE probes
+
+
+#Q2: What differences between baseline and on-treatment in all pts who experienced pCR? 
+broad_limBC_top2b<- topTable(broad_limBC_top0, coef='PCR_OTvB',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P')
+broad_limBC_top2bsig<-broad_limBC_top2b%>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 374 DE probes
+
+
+#Q3: What differences between baseline and on-treatment in all pts who had RD? 
+broad_limBC_top3b<- topTable(broad_limBC_top0, coef='RD_OTvB',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_limBC_top3bsig<-broad_limBC_top3b %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 387 DE probes
+
+
+#Q4: Any baseline differences between pts who later experience RD or PCR?
+broad_limBC_top4b<- topTable(broad_limBC_top0, coef='PCRvRD_B',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_limBC_top4bsig<- broad_limBC_top4b %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) #1 DE probe
+
+
+#Q5: Any differences during treatment between pts who later experience RD or PCR?
+broad_limBC_top5b<- topTable(broad_limBC_top0, coef='PCRvRD_OT',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_limBC_top5bsig <- broad_limBC_top5b %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+```
+
+
+# C. #~0 + RESPTIME + TREATMENT + ERSTATUS + PR_STATUS + SD
+```{r}
+
+#make the design 
+broad_design_limBC <- model.matrix(~0 + RESP_TIME + TREATMENT + ER_STATUS + PR_STATUS + SD)#four columns of interest - PCR baseline/on-treatment, RD baseline/on-treatment. INCLUDES SCAN DATE.  #this accounts for drug_response, and sample_type
+colnames(broad_design_limBC) <- sub("RESP_TIME", "",
+                               sub("TREATMENTT", "T", 
+                              gsub("-", "", colnames(broad_design_limBC))))
+
+broad_fit_limBC <- lmFit(object=matched_eset_filt, design=broad_design_limBC, block= NULL , correlation=NULL) #no blocking variable
+
+#now compare the groups using a contrast matrix 
+broad_contrasts_limBC <- makeContrasts(
+  #Q1: Any overall differences between PCR and RD? 
+  PCRvRD = (PCR_ON_TREATMENT - PCR_BASELINE) - (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q2: What differences between baseline and on-treatment in all pts who experienced PCR? 
+  PCR_OTvB = (PCR_ON_TREATMENT - PCR_BASELINE),
+  
+  #Q3: What differences between baseline and on-treatment in all pts who had RD? 
+  RD_OTvB = (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q4: Any baseline differences between pts who later experience RD or PCR?
+  PCRvRD_B = (PCR_BASELINE - RD_BASELINE),
+  
+  #Q5: Any differences during treatment between pts who later experience RD or PCR?
+  PCRvRD_OT = (PCR_ON_TREATMENT - RD_ON_TREATMENT),
+  levels = colnames(broad_design_limBC))
+  
+broad_fit_limBC <- contrasts.fit(broad_fit_limBC, broad_contrasts_limBC)
+
+broad_limBC_top0 <-  eBayes(broad_fit_limBC) #fit empirical Bayes model
+
+
+
+#Q1: Any overall differences between PCR and RD? 
+broad_limBC_top1c<- topTable(broad_limBC_top0, coef='PCRvRD',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_limBC_top1csig <- broad_limBC_top1c %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+
+
+#Q2: What differences between baseline and on-treatment in all pts who experienced pCR? 
+broad_limBC_top2c<- topTable(broad_limBC_top0, coef='PCR_OTvB',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P')
+broad_limBC_top2csig <-broad_limBC_top2c %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+
+
+#Q3: What differences between baseline and on-treatment in all pts who had RD? 
+broad_limBC_top3c<- topTable(broad_limBC_top0, coef='RD_OTvB',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_limBC_top3csig<-broad_limBC_top3c %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 387 DE probes
+
+
+#Q4: Any baseline differences between pts who later experience RD or PCR?
+broad_limBC_top4c<- topTable(broad_limBC_top0, coef='PCRvRD_B',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_limBC_top4csig<- broad_limBC_top4c %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) #1 DE probe
+
+
+#Q5: Any differences during treatment between pts who later experience RD or PCR?
+broad_limBC_top5c<- topTable(broad_limBC_top0, coef='PCRvRD_OT',adjust='bonferroni',number=length(matched_eset_filt),sort.by='P') 
+broad_limBC_top5csig <- broad_limBC_top5c %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+```
+
+#How many DE probes did each model identify for data that was NOT batch corrected at all?
+```{r}
+dim(broad_limBC_top1asig)[1]
+
+dim(broad_limBC_top1bsig)[1]
+
+dim(broad_limBC_top1csig)[1]
+
+dim(broad_limBC_top2asig)[1]
+
+dim(broad_limBC_top2bsig)[1]
+
+dim(broad_limBC_top2csig)[1]
+
+dim(broad_limBC_top3asig)[1]
+
+dim(broad_limBC_top3bsig)[1]
+
+dim(broad_limBC_top3csig)[1]
+
+dim(broad_limBC_top4asig)[1]
+
+dim(broad_limBC_top4bsig)[1]
+
+dim(broad_limBC_top4csig)[1]
+
+dim(broad_limBC_top5asig)[1]
+
+dim(broad_limBC_top5bsig)[1]
+
+dim(broad_limBC_top5csig)[1]
+
+```
+
+
+
+# Some plots for those models.
+```{r}
+
+# # volcano plot for limBC,  comparison 2 (pCR OTvB), model A (~0 + RESP_TIME),
+# plot(broad_limBC_top2a$logFC,-log10(broad_limBC_top2a$adj.P.Val), main="DEGs in pts who had pCR (on-treatment vs baseline)", xlab="log2(pCR_OT/pCR_B)", ylab="-log10(adj P value)", xlim = c(-4,7), ylim = c(0,80))
+# text(-3, 70, label = "Downreg in pCR pts", cex = 1.5)  #contrast made is on-treatment - baseline. So this is looking at DE relative to on-treatment samples. 
+# text(3, 70, label = "Upregulated in pCR pts", cex = 1.5)
+# abline(v=1.5, col="red")  #change ablines depending on logFC cutoff
+# abline(v= -1.5, col="red")
+# abline(h=1.3, col="green") # change depending on -log10(adj.p.value)
+
+
+# # volcano plot for limBC,  comparison 3 (RD OTvB), model A (~0 + RESP_TIME),
+# plot(broad_limBC_top3a$logFC,-log10(broad_limBC_top3a$adj.P.Val), main="DEGs in pts who had RD (on-treatment vs baseline)", xlab="log2(RD_OT/RD_B)", ylab="-log10(adj P value)", xlim = c(-4,7), ylim = c(0,80))
+# text(-3, 70, label = "Downreg when OT", cex = 1.5)  #contrast made is on-treatment - baseline. 
+# text(3, 70, label = "Upregulated when OT", cex = 1.5)
+# abline(v=1.5, col="red") #change ablines depending on logFC cutoff
+# abline(v= -1.5, col="red")
+# abline(h=1.3, col="green") # change depending on -log10(adj.p.value)
+
+
+
+# #Venn diagram for limBC,  using model A (~0 + RESP_TIME), comparing comparison 2 (pCR OTvB) and comparison 3(RD OTvB), 
+# list_venn <- list(PCR_OTvB = rownames(broad_limBC_top2asig),
+#                   RD_OTvB = rownames(broad_limBC_top3asig))
+# ggvenn(list_venn, c("PCR_OTvB", "RD_OTvB"))
+
+
+
+# #compare across the different models (A,B,C) in the pCR OTvB comparison (number 2) 
+# list_venn <- list(limBC_RESP = rownames(broad_limBC_top2asig),
+#                   limBC_RESP_T = rownames(broad_limBC_top2bsig),
+#                   limBC_RESP_T_EP = rownames(broad_limBC_top2csig))
+# ggvenn(list_venn, c("limBC_RESP", "limBC_RESP_T", "limBC_RESP_T_EP"))
+
+
+
+# #compare across the different models (A,B,C) in the RD OTvB comparison (number 3) 
+# list_venn <- list(limBC_RESP = rownames(broad_limBC_top3asig),
+#                   limBC_RESP_T = rownames(broad_limBC_top3bsig),
+#                   limBC_RESP_T_EP = rownames(broad_limBC_top3csig))
+# ggvenn(list_venn, c("limBC_RESP", "limBC_RESP_T", "limBC_RESP_T_EP"))  
+
+```
+
+
+# F-stats QQ plot and p-value histogram for the model.
+```{r}
+# library(car)
+# qqPlot(broad_limBC_top0[["F"]])
+# hist(broad_limBC_top0[["F.p.value"]])
+# hist(broad_limBC_top0[["p.value"]])
+```
+
+
+
+
+
+### **4. Using ComBat-corrected data in limma. **
+Make sure to use batch_corrected_matched eset for this section. The SD component is no longer being used in the model.matrix component as ComBat has corrected for the batch effect scan date causes. Like in section 2: No batch correction, broad_design_noBC is used in this section.  
+
+
+# A. ~0 + RESP_TIME
+```{r}
+
+#make the design               ### NOTE: using broad_design_noBC because it does not have scandate. Just making sure to rename the subsequent fit objects that use ComBat-corrected data. 
+
+broad_design_noBC <- model.matrix(~0 + RESP_TIME) #four columns of interest - PCR baseline/on-treatment, RD baseline/on-treatment. NO SCAN DATE. 
+colnames(broad_design_noBC) <- sub("RESP_TIME", "",
+                               sub("TREATMENTT", "T", 
+                              gsub("-", "", colnames(broad_design_noBC))))
+
+ncol(broad_design_noBC)  #4
+qr(broad_design_noBC)$rank #4
+
+#Test to see if sample matchings should be included in the model as a blocking variable
+#Check if PT_ID is correlated to the expression data. 
+#broad_cor_ComBat <- duplicateCorrelation(batch_corrected_matched_eset, broad_design_noBC, block=PT)
+#broad_cor_ComBat$consensus.correlation #-0.334-- negative correlation means remove the blocking variable 
+
+broad_fit_ComBat <- lmFit(object=batch_corrected_matched_eset, design=broad_design_noBC, block= NULL , correlation=NULL) #no blocking variable, **USING batch_corrected_matched_eset**
+#View(broad_fit[["coefficients"]]) #this mixed effects model estimates MEAN GENE EXPRESSION of each group
+
+#View(broad_fit[["coefficients"]][,1]) #mean gene expression for patients at who exp pCR at baseline 
+
+
+#now compare the groups using a contrast matrix 
+broad_contrasts_noBC <- makeContrasts(
+  #Q1: Any overall differences between PCR and RD? 
+  PCRvRD = (PCR_ON_TREATMENT - PCR_BASELINE) - (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q2: What differences between baseline and on-treatment in all pts who experienced PCR? 
+  PCR_OTvB = (PCR_ON_TREATMENT - PCR_BASELINE),
+  
+  #Q3: What differences between baseline and on-treatment in all pts who had RD? 
+  RD_OTvB = (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q4: Any baseline differences between pts who later experience RD or PCR?
+  PCRvRD_B = (PCR_BASELINE - RD_BASELINE),
+  
+  #Q5: Any differences during treatment between pts who later experience RD or PCR?
+  PCRvRD_OT = (PCR_ON_TREATMENT - RD_ON_TREATMENT),
+  levels = colnames(broad_design_noBC))
+  
+#View(broad_contrasts_noBC)
+
+#now fit the model
+broad_fit_ComBat <- contrasts.fit(broad_fit_ComBat, broad_contrasts_noBC) #apply the broad_design_noBC to ComBat-corrected data
+
+
+#compute moderated t-stat, F-stat, and log-odds of differential expression for each gene
+broad_ComBat_top0 <-  eBayes(broad_fit_ComBat) #fit empirical Bayes model
+
+
+
+#Q1: Any overall differences between PCR and RD? 
+broad_ComBat_top1a<- topTable(broad_ComBat_top0, coef='PCRvRD',adjust='bonferroni',number=length(batch_corrected_matched_eset),sort.by='P') 
+broad_ComBat_top1asig <- broad_ComBat_top1a %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 1 DE probes
+
+
+#Q2: What differences between baseline and on-treatment in all pts who experienced pCR? 
+broad_ComBat_top2a<- topTable(broad_ComBat_top0, coef='PCR_OTvB',adjust='bonferroni',number=length(batch_corrected_matched_eset),sort.by='P')
+broad_ComBat_top2asig<-broad_ComBat_top2a %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 374 DE probes
+
+
+#Q3: What differences between baseline and on-treatment in all pts who had RD? 
+broad_ComBat_top3a<- topTable(broad_ComBat_top0, coef='RD_OTvB',adjust='bonferroni',number=length(batch_corrected_matched_eset),sort.by='P') 
+broad_ComBat_top3asig<-broad_ComBat_top3a %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 387 DE probes
+
+
+#Q4: Any baseline differences between pts who later experience RD or PCR?
+broad_ComBat_top4a<- topTable(broad_ComBat_top0, coef='PCRvRD_B',adjust='bonferroni',number=length(batch_corrected_matched_eset),sort.by='P') 
+broad_ComBat_top4asig<- broad_ComBat_top4a %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) #1 DE probe
+
+
+#Q5: Any differences during treatment between pts who later experience RD or PCR?
+broad_ComBat_top5a<- topTable(broad_ComBat_top0, coef='PCRvRD_OT',adjust='bonferroni',number=length(batch_corrected_matched_eset),sort.by='P') 
+broad_ComBat_top5asig <- broad_ComBat_top5a %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+```
+
+
+# B. ~0 + RESPTIME + TREATMENT
+```{r}
+
+#make the design
+broad_design_noBC <- model.matrix(~0 + RESP_TIME + TREATMENT) #four columns of interest - PCR baseline/on-treatment, RD baseline/on-treatment. NO SCAN DATE. 
+colnames(broad_design_noBC) <- sub("RESP_TIME", "",
+                               sub("TREATMENTT", "T", 
+                              gsub("-", "", colnames(broad_design_noBC))))
+
+broad_fit_ComBat <- lmFit(object=batch_corrected_matched_eset, design=broad_design_noBC, block= NULL , correlation=NULL) #no blocking variable as per previous chunk
+
+#now compare the groups using a contrast matrix 
+broad_contrasts_noBC <- makeContrasts(
+  #Q1: Any overall differences between PCR and RD? 
+  PCRvRD = (PCR_ON_TREATMENT - PCR_BASELINE) - (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q2: What differences between baseline and on-treatment in all pts who experienced PCR? 
+  PCR_OTvB = (PCR_ON_TREATMENT - PCR_BASELINE),
+  
+  #Q3: What differences between baseline and on-treatment in all pts who had RD? 
+  RD_OTvB = (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q4: Any baseline differences between pts who later experience RD or PCR?
+  PCRvRD_B = (PCR_BASELINE - RD_BASELINE),
+  
+  #Q5: Any differences during treatment between pts who later experience RD or PCR?
+  PCRvRD_OT = (PCR_ON_TREATMENT - RD_ON_TREATMENT),
+  levels = colnames(broad_design_noBC))
+
+
+#now fit the model
+broad_fit_ComBat <- contrasts.fit(broad_fit_ComBat, broad_contrasts_noBC) #apply the broad_design_noBC to ComBat-corrected data
+
+
+#compute moderated t-stat, F-stat, and log-odds of differential expression for each gene
+broad_ComBat_top0 <-  eBayes(broad_fit_ComBat) #fit empirical Bayes model
+
+
+
+
+#Q1: Any overall differences between PCR and RD? 
+broad_ComBat_top1b<- topTable(broad_ComBat_top0, coef='PCRvRD',adjust='bonferroni',number=length(batch_corrected_matched_eset),sort.by='P') 
+broad_ComBat_top1bsig <- broad_ComBat_top1b %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 1 DE probes
+
+
+#Q2: What differences between baseline and on-treatment in all pts who experienced pCR? 
+broad_ComBat_top2b<- topTable(broad_ComBat_top0, coef='PCR_OTvB',adjust='bonferroni',number=length(batch_corrected_matched_eset),sort.by='P')
+broad_ComBat_top2bsig<-broad_ComBat_top2b%>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 374 DE probes
+
+
+#Q3: What differences between baseline and on-treatment in all pts who had RD? 
+broad_ComBat_top3b<- topTable(broad_ComBat_top0, coef='RD_OTvB',adjust='bonferroni',number=length(batch_corrected_matched_eset),sort.by='P') 
+broad_ComBat_top3bsig<-broad_ComBat_top3b %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 387 DE probes
+
+
+#Q4: Any baseline differences between pts who later experience RD or PCR?
+broad_ComBat_top4b<- topTable(broad_ComBat_top0, coef='PCRvRD_B',adjust='bonferroni',number=length(batch_corrected_matched_eset),sort.by='P') 
+broad_ComBat_top4bsig<- broad_ComBat_top4b %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) #1 DE probe
+
+
+#Q5: Any differences during treatment between pts who later experience RD or PCR?
+broad_ComBat_top5b<- topTable(broad_ComBat_top0, coef='PCRvRD_OT',adjust='bonferroni',number=length(batch_corrected_matched_eset),sort.by='P') 
+broad_ComBat_top5bsig <- broad_ComBat_top5b %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+
+```
+
+# C. ~0 + RESPTIME + TREATMENT + ER_STATUS + PR_STATUS
+```{r}
+
+#make the design
+
+broad_design_noBC <- model.matrix(~0 + RESP_TIME + TREATMENT + ER_STATUS + PR_STATUS) #four columns of interest - PCR baseline/on-treatment, RD baseline/on-treatment. NO SCAN DATE. 
+colnames(broad_design_noBC) <- sub("RESP_TIME", "",
+                               sub("TREATMENTT", "T", 
+                              gsub("-", "", colnames(broad_design_noBC))))
+
+broad_fit_ComBat <- lmFit(object=batch_corrected_matched_eset, design=broad_design_noBC, block= NULL , correlation=NULL) #no blocking variable
+
+#now compare the groups using a contrast matrix 
+broad_contrasts_noBC <- makeContrasts(
+  #Q1: Any overall differences between PCR and RD? 
+  PCRvRD = (PCR_ON_TREATMENT - PCR_BASELINE) - (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q2: What differences between baseline and on-treatment in all pts who experienced PCR? 
+  PCR_OTvB = (PCR_ON_TREATMENT - PCR_BASELINE),
+  
+  #Q3: What differences between baseline and on-treatment in all pts who had RD? 
+  RD_OTvB = (RD_ON_TREATMENT - RD_BASELINE),
+  
+  #Q4: Any baseline differences between pts who later experience RD or PCR?
+  PCRvRD_B = (PCR_BASELINE - RD_BASELINE),
+  
+  #Q5: Any differences during treatment between pts who later experience RD or PCR?
+  PCRvRD_OT = (PCR_ON_TREATMENT - RD_ON_TREATMENT),
+  levels = colnames(broad_design_noBC))
+
+
+#now fit the model
+broad_fit_ComBat <- contrasts.fit(broad_fit_ComBat, broad_contrasts_noBC) #apply the broad_design_noBC to ComBat-corrected data
+
+
+#compute moderated t-stat, F-stat, and log-odds of differential expression for each gene
+broad_ComBat_top0 <-  eBayes(broad_fit_ComBat) #fit empirical Bayes model
+
+
+#Q1: Any overall differences between PCR and RD? 
+broad_ComBat_top1c<- topTable(broad_ComBat_top0, coef='PCRvRD',adjust='bonferroni',number=length(batch_corrected_matched_eset),sort.by='P') 
+broad_ComBat_top1csig <- broad_ComBat_top1c %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 1 DE probes
+
+
+#Q2: What differences between baseline and on-treatment in all pts who experienced pCR? 
+broad_ComBat_top2c<- topTable(broad_ComBat_top0, coef='PCR_OTvB',adjust='bonferroni',number=length(batch_corrected_matched_eset),sort.by='P')
+broad_ComBat_top2csig<-broad_ComBat_top2c%>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 374 DE probes
+
+
+#Q3: What differences between baseline and on-treatment in all pts who had RD? 
+broad_ComBat_top3c<- topTable(broad_ComBat_top0, coef='RD_OTvB',adjust='bonferroni',number=length(batch_corrected_matched_eset),sort.by='P') 
+broad_ComBat_top3csig<-broad_ComBat_top3c %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) # 387 DE probes
+
+
+#Q4: Any baseline differences between pts who later experience RD or PCR?
+broad_ComBat_top4c<- topTable(broad_ComBat_top0, coef='PCRvRD_B',adjust='bonferroni',number=length(batch_corrected_matched_eset),sort.by='P') 
+broad_ComBat_top4csig<- broad_ComBat_top4c %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5) #1 DE probe
+
+
+#Q5: Any differences during treatment between pts who later experience RD or PCR?
+broad_ComBat_top5c<- topTable(broad_ComBat_top0, coef='PCRvRD_OT',adjust='bonferroni',number=length(batch_corrected_matched_eset),sort.by='P') 
+broad_ComBat_top5csig <- broad_ComBat_top5c %>% filter(adj.P.Val < 0.01 & abs(logFC)>2.5)
+
+```
+
+#Dimensions of DEG tables
+```{r}
+ dim(broad_ComBat_top1asig)[1]
+
+dim(broad_ComBat_top1bsig)[1]
+
+dim(broad_ComBat_top1csig)[1]
+
+dim(broad_ComBat_top2asig)[1]
+
+dim(broad_ComBat_top2bsig)[1]
+
+dim(broad_ComBat_top2csig)[1]
+
+dim(broad_ComBat_top3asig)[1]
+
+dim(broad_ComBat_top3bsig)[1]
+
+dim(broad_ComBat_top3csig)[1]
+
+dim(broad_ComBat_top4asig)[1]
+
+dim(broad_ComBat_top4bsig)[1]
+
+dim(broad_ComBat_top4csig)[1]
+
+dim(broad_ComBat_top5asig)[1]
+
+dim(broad_ComBat_top5bsig)[1]
+
+dim(broad_ComBat_top5csig)[1]
+
+```
+
+
+
+#Some plots using those models. 
+```{r}
+# par(mfrow = c(2,2))
+# 
+# plot(broad_ComBat_top1a$logFC,-log10(broad_ComBat_top1a$adj.P.Val), main="DEGs between PCR and RD overall", xlab="log2(pCR_OT-B/RD_OT-B)", ylab="-log10(adj P value)",  xlim = c(-4,7), ylim = c(0,80))
+# text(-3, 70, label = "Downreg in pCR pts", cex = 1.5)  #constrast made is (pCR_OT - pCR_B) - (RD_OT - RD_B). So this is looking at overall DE relative to pCR patients
+# text(3, 70, label = "Upregulated in pCR pts", cex = 1.5)
+# abline(v=1.5, col="red")
+# abline(v= -1.5, col="red")
+# abline(h=1.3, col="green")
+# 
+# 
+# 
+# #venn diagram of DEGs from ComBat-corrected model A (~0 + RESP_TIME), between three comparisons (1 - pCR vs RD, 2 - pCR OTvB, 3 - RD OTvB)
+# list_venn <- list(PCR_OTvB = rownames(broad_ComBat_top3asig),
+#                   RD_OTvB = rownames(broad_ComBat_top3asig),
+#                   PCRvRD_overall = rownames(broad_ComBat_top1asig))
+# ggvenn(list_venn, c("PCR_OTvB", "RD_OTvB","PCRvRD_overall"))
+# 
+# 
+# 
+# #comparing across the ComBat-corrected models A, B and C for comparison 1 - pCRvRD
+# list_venn <- list(ComBat_RESPTIME = rownames(broad_ComBat_top1asig),
+#                   ComBat_RESPTIME_T= rownames(broad_ComBat_top1bsig),
+#                   ComBat_RESPTIME_T_EP = rownames(broad_ComBat_top1csig))
+# ggvenn(list_venn, c("ComBat_RESPTIME", "ComBat_RESPTIME_T","ComBat_RESPTIME_T_EP"))
+# 
+# 
+# 
+# #comparing across the ComBat-corrected models A, B and C for comparison 2 - pCR OTvB
+# list_venn <- list(ComBat_RESPTIME = rownames(broad_ComBat_top2asig),
+#                   ComBat_RESPTIME_T= rownames(broad_ComBat_top2bsig),
+#                   ComBat_RESPTIME_T_EP = rownames(broad_ComBat_top2csig))
+# ggvenn(list_venn, c("ComBat_RESPTIME", "ComBat_RESPTIME_T","ComBat_RESPTIME_T_EP"))
+
+
+```
+
+
+### **6. Make a table with numbers of DEGs between batch correction variations. **
+Adjusted for the various covariates did not have a big effect - looking at the below tables, seems that the model type (A,B,C) doesn't affect the number of DEGs identified by much. Batch correction has more of an effect? 
+```{r}
+
+#A. ~0 +RESP_TIME
+DEA_response_batch_correction_variations_a <- data.frame(comparisons = c("pCRvRD", "pCR OTvB", "RD OTvB", "pCR v RD B", "pCR v RD OT"), 
+                                                       DEGs_noBC = c(nrow(broad_noBC_top1asig), nrow(broad_noBC_top2asig), nrow(broad_noBC_top3asig), nrow(broad_noBC_top4asig), nrow(broad_noBC_top5asig)),
+                                                       DEGs_BC_in_design = c(nrow(broad_limBC_top1asig), nrow(broad_limBC_top2asig), nrow(broad_limBC_top3asig), nrow(broad_limBC_top4asig), nrow(broad_limBC_top5asig)),
+                                                       DEGs_ComBat = c(nrow(broad_ComBat_top1asig), nrow(broad_ComBat_top2asig), nrow(broad_ComBat_top3asig), nrow(broad_ComBat_top4asig), nrow(broad_ComBat_top5asig)))
+
+
+#B. ~0 +RESP_TIME + TREATMENT
+DEA_response_batch_correction_variations_b <- data.frame(comparisons = c("pCRvRD", "pCR OTvB", "RD OTvB", "pCR v RD B", "pCR v RD OT"),  
+                                                       DEGs_noBC = c(nrow(broad_noBC_top1bsig), nrow(broad_noBC_top2bsig), nrow(broad_noBC_top3bsig), nrow(broad_noBC_top4bsig), nrow(broad_noBC_top5bsig)),
+                                                       DEGs_BC_in_design = c(nrow(broad_limBC_top1bsig), nrow(broad_limBC_top2bsig), nrow(broad_limBC_top3bsig), nrow(broad_limBC_top4bsig), nrow(broad_limBC_top5bsig)),
+                                                       DEGs_ComBat = c(nrow(broad_ComBat_top1bsig), nrow(broad_ComBat_top2bsig), nrow(broad_ComBat_top3bsig), nrow(broad_ComBat_top4bsig), nrow(broad_ComBat_top5bsig)))
+
+
+#C. ~0 +RESP_TIME + TREATMENT + ER_STATUS + PR_STATUS
+DEA_response_batch_correction_variations_c <- data.frame(comparisons = c("pCRvRD", "pCR OTvB", "RD OTvB", "pCR v RD B", "pCR v RD OT"), 
+                                                       DEGs_noBC = c(nrow(broad_noBC_top1csig), nrow(broad_noBC_top2csig), nrow(broad_noBC_top3csig), nrow(broad_noBC_top4csig), nrow(broad_noBC_top5csig)),
+                                                       DEGs_BC_in_design = c(nrow(broad_limBC_top1csig), nrow(broad_limBC_top2csig), nrow(broad_limBC_top3csig), nrow(broad_limBC_top4csig), nrow(broad_limBC_top5csig)),
+                                                       DEGs_ComBat = c(nrow(broad_ComBat_top1csig), nrow(broad_ComBat_top2csig), nrow(broad_ComBat_top3csig), nrow(broad_ComBat_top4csig), nrow(broad_ComBat_top5csig)))
+
+
+#CONCLUSION: will go with the ~0 +RESP_TIME + TREATMENT + ER_STATUS + PR_STATUS model. Accounts for all major covariates without changing much. Also, limma correction is generally recommended. So maybe the limma-corrected model that accounts for all of the listed covariates - broad_limBC_topXc
+
+```
+
+# Bar charts showing overlap of DEGs when FDR and FC are changed (used model C: ~0 + RESP_TIME + TREATMENT + ER_STATUS + PR_STATUS (+SD))
+NOTE: I manually typed in these values (taken from the DEA_response_batch_correction_variations tables in the chunk above) after re-running DEA chunks and varying the p.adj method, FDR and FC. An excel-type file containing all of these values is in my shared Google Drive folder, titled "DEA Batch Correction Variations", in the tab "Batch Correction/FDR/FC variation". Did not repeat for models A and B. 
+```{r}
+
+# ####### OVERALL pCR vs RD COMPARISON #######
+# 
+# #table of DEGS in overall pCR vs RD comparison - BH correction
+# BH_params <- data.frame(batch_method = rep(c("noBC", "limBC", "ComBat"),6),
+#                         params = c(rep("FC1.5_FDR0.05", 3),
+#                                    rep("FC1.5_FDR0.01", 3),
+#                                    rep("FC2_FDR0.05", 3),
+#                                    rep("FC2_FDR0.01",3),
+#                                    rep("FC3_FDR0.05", 3),
+#                                    rep("FC3_FDR0.01",3)),
+#                         DEGs =  c(1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0))
+# 
+# #table of DEGS in overall pCR vs RD comparison - Bonferroni correction
+# Bonf_params <- data.frame(batch_method = rep(c("noBC", "limBC", "ComBat"),6),
+#                         params = c(rep("FC1.5_FDR0.05", 3),
+#                                    rep("FC1.5_FDR0.01", 3),
+#                                    rep("FC2_FDR0.05", 3),
+#                                    rep("FC2_FDR0.01",3),
+#                                    rep("FC3_FDR0.05", 3),
+#                                    rep("FC3_FDR0.01",3)),
+#                         DEGs =  c(1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0))
+# 
+# BH_params$batch_method <- factor(BH_params$batch_method, levels = c("noBC","limBC","ComBat")) # make BC methods into factors for barchart later on
+# Bonf_params$batch_method <- factor(Bonf_params$batch_method, levels = c("noBC","limBC","ComBat"))
+# 
+# 
+# #make barchart of BH corrected DEGs  - 
+# BH_params %>%
+# group_by(params, batch_method) %>%
+#   ggplot(aes(params, DEGs)) +
+#   ylim(0,450) +
+#   geom_bar(aes(fill = batch_method),
+#            position = "dodge",
+#            stat = "identity") +
+#   theme_test()
+# 
+# # make barchart for Bonferroni corrected DEGs
+# Bonf_params %>%
+# group_by(params, batch_method) %>%
+#   ggplot(aes(params, DEGs)) +
+#   ylim(0,450) + 
+#   geom_bar(aes(fill = batch_method),
+#            position = "dodge",
+#            stat = "identity") +
+#   theme_test()
+# 
+# 
+# 
+# ####### pCR OT v B COMPARISON #######
+# 
+# #table of DEGs - BH 
+# BH_params <-  data.frame(batch_method = rep(c("noBC", "limBC", "ComBat"),6),
+#                         params = c(rep("FC1.5_FDR0.05", 3),
+#                                    rep("FC1.5_FDR0.01", 3),
+#                                    rep("FC2_FDR0.05", 3),
+#                                    rep("FC2_FDR0.01",3),
+#                                    rep("FC3_FDR0.05", 3),
+#                                    rep("FC3_FDR0.01",3)),
+#                         DEGs =  c(383, 373, 365, 383, 373, 365, 154, 146, 147, 154, 146, 147, 31, 29, 27, 31, 29, 27))
+# 
+# #table of DEGs - Bonferroni
+# Bonf_params <-  data.frame(batch_method = rep(c("noBC", "limBC", "ComBat"),6),
+#                         params = c(rep("FC1.5_FDR0.05", 3),
+#                                    rep("FC1.5_FDR0.01", 3),
+#                                    rep("FC2_FDR0.05", 3),
+#                                    rep("FC2_FDR0.01",3),
+#                                    rep("FC3_FDR0.05", 3),
+#                                    rep("FC3_FDR0.01",3)),
+#                         DEGs =  c(365, 355, 351, 355, 341, 341, 151, 143, 146, 149, 141, 144, 31, 29, 27, 31, 29, 27))
+# 
+# 
+# BH_params$batch_method <- factor(BH_params$batch_method, levels = c("noBC","limBC","ComBat")) #make BC methods into factors for barchart
+# Bonf_params$batch_method <- factor(Bonf_params$batch_method, levels = c("noBC","limBC","ComBat"))
+# 
+# 
+# #make BH barchart
+# BH_params %>%
+# group_by(params, batch_method) %>%
+#   ggplot(aes(params, DEGs)) +
+#   ylim(0,450) +
+#   geom_bar(aes(fill = batch_method),
+#            position = "dodge",
+#            stat = "identity") +
+#   theme_test()
+# 
+# # make Bonferroni barchart
+# Bonf_params %>%
+# group_by(params, batch_method) %>%
+#   ggplot(aes(params, DEGs)) +
+#   ylim(0,450) + 
+#   geom_bar(aes(fill = batch_method),
+#            position = "dodge",
+#            stat = "identity") +
+#   theme_test()
+# 
+# 
+# 
+# ####### RD OT v B COMPARISON #######
+# 
+# #table of DEGs - BH
+# BH_params <- data.frame(batch_method = rep(c("noBC", "limBC", "ComBat"),6),
+#                         params = c(rep("FC1.5_FDR0.05", 3),
+#                                    rep("FC1.5_FDR0.01", 3),
+#                                    rep("FC2_FDR0.05", 3),
+#                                    rep("FC2_FDR0.01",3),
+#                                    rep("FC3_FDR0.05", 3),
+#                                    rep("FC3_FDR0.01",3)),
+#                         DEGs =  c(422, 389, 372, 422, 389, 372, 135, 122, 120, 135, 122, 120, 27, 21, 22, 27, 21, 22))
+# 
+# #Table of DEGs - Bonferroni
+# Bonf_params <- data.frame(batch_method = rep(c("noBC", "limBC", "ComBat"),6),
+#                         params = c(rep("FC1.5_FDR0.05", 3),
+#                                    rep("FC1.5_FDR0.01", 3),
+#                                    rep("FC2_FDR0.05", 3),
+#                                    rep("FC2_FDR0.01",3),
+#                                    rep("FC3_FDR0.05", 3),
+#                                    rep("FC3_FDR0.01",3)),
+#                         DEGs =  c(415, 381, 367, 414, 377, 367, 135, 122, 120, 135, 122, 120, 27, 21, 22, 27, 21, 22))
+# 
+# 
+# BH_params$batch_method <- factor(BH_params$batch_method, levels = c("noBC","limBC","ComBat")) # make BC methods into factors for barchart
+# Bonf_params$batch_method <- factor(Bonf_params$batch_method, levels = c("noBC","limBC","ComBat"))
+# 
+# #barchart for BH DEGs
+# BH_params %>%
+# group_by(params, batch_method) %>%
+#   ggplot(aes(params, DEGs)) +
+#   ylim(0,450) + 
+#   geom_bar(aes(fill = batch_method),
+#            position = "dodge",
+#            stat = "identity") +
+#   theme_test()
+# 
+# #barchart for bonferroni DEGs
+# Bonf_params %>%
+# group_by(params, batch_method) %>%
+#   ggplot(aes(params, DEGs)) +
+#   ylim(0,450) + 
+#   geom_bar(aes(fill = batch_method),
+#            position = "dodge",
+#            stat = "identity") +
+#   theme_test()
+```
+
+
+
+# **The different covariate-adjusted models generally seem to identify the same number of genes. Are numbers of DEGs the same between covariate models with varied batch correction methods?**
+And do the models/batch correction variations identify the same genes (what % are the same?)
+
+For bonferroni correction, FDR = 0.01, and FC > 3...
+- 27 genes identified as DE by all 9 models in pCR OTvB
+- 20 genes identified as DE by all 9 models in RD OTvB
+
+- 18 of these genes are DE in both pCR OTvB and RD OTvB. 
+```{r}
+#pCR OT v B  
+
+#upset plot to look at overlap of DEGs between the models and batch correction methods
+library(UpSetR)
+lt_pCR_OTvB <- list(noBC_RESP = rownames(broad_noBC_top2asig),   #make list of significant genes from each model
+           limBC_RESP = rownames(broad_limBC_top2asig),
+           ComBat_RESP = rownames(broad_ComBat_top2asig),
+           noBC_RESP_T = rownames(broad_noBC_top2bsig),
+           limBC_RESP_T = rownames(broad_limBC_top2bsig),
+           ComB_RESP_T = rownames(broad_ComBat_top2bsig),
+           noBC_RESP_T_EP = rownames(broad_noBC_top2csig),
+           limBC_RESP_T_EP = rownames(broad_limBC_top2csig),
+           ComBat_RESP_T_EP = rownames(broad_ComBat_top2csig))
+
+
+#make upset plot
+upset(fromList(lt_pCR_OTvB), sets = c("noBC_RESP","limBC_RESP","ComBat_RESP","noBC_RESP_T","limBC_RESP_T","ComB_RESP_T","noBC_RESP_T_EP", "limBC_RESP_T_EP", "ComBat_RESP_T_EP"), order.by = "freq", mb.ratio = c(0.55, 0.45)) #make upset plot
+  
+           
+ModBC_intersect_pCR_OTvB <- Reduce(intersect, lt_pCR_OTvB) #find DE probes common to ALL 9 MODELs for pCR OTvB comparison
+
+
+
+# RD OT v B 
+#upset plot to look at overlap of DEGs between the models and batch correction methods
+
+lt_RD_OTvB <- list(noBC_RESP = rownames(broad_noBC_top3asig), #make list of significant genes from each model
+           limBC_RESP = rownames(broad_limBC_top3asig),
+           ComBat_RESP = rownames(broad_ComBat_top3asig),
+           noBC_RESP_T = rownames(broad_noBC_top3bsig),
+           limBC_RESP_T = rownames(broad_limBC_top3bsig),
+           ComB_RESP_T = rownames(broad_ComBat_top3bsig),
+           noBC_RESP_T_EP = rownames(broad_noBC_top3csig),
+           limBC_RESP_T_EP = rownames(broad_limBC_top3csig),
+           ComBat_RESP_T_EP = rownames(broad_ComBat_top3csig))
+
+
+#make upset plot
+upset(fromList(lt_RD_OTvB), sets = c("noBC_RESP","limBC_RESP","ComBat_RESP","noBC_RESP_T","limBC_RESP_T","ComB_RESP_T","noBC_RESP_T_EP", "limBC_RESP_T_EP", "ComBat_RESP_T_EP"), order.by = "freq", mb.ratio = c(0.55, 0.45)) # make upset plot
+  
+#pull out all common DE probes
+ModBC_intersect_RD_OTvB <- Reduce(intersect, lt_RD_OTvB) # find DE probes common to ALL 9 MODELs for RD OTvB comparison
+           
+
+
+#look at overlap of DEGs common to all 9 models for each comparison (pCR OTvB vs RD OTvB) 
+list_venn <- list(pCR_OTvB = ModBC_intersect_pCR_OTvB,
+                  RD_OTvB = ModBC_intersect_RD_OTvB)
+ggvenn(list_venn, c("pCR_OTvB", "RD_OTvB"))  
+```
+
+#Make volcano plots of the genes identified as DE by all models in previous chunk. 
+```{r}
+# #So pCR OTvB and RD OTvB both have X DEGs identified by all models. Y of these are DE upon treatment in pts with pCR and RD. I want to look at the logFC of all X genes for pCR and also for RD. Then I want to look at only the Y shared genes for each comparison. Then i want to look at the non-shared/unique genes for each comparison. The logFC values won't differ between the models, so I'll just pick the limBC correction, and  ~0 +RESPTIME + TREATMENT + ER+ PR model (model C). However, adjusted p values will change but theyre all signficant anyway. 
+# 
+# 
+# ### ALL X DEGs ###
+# 
+# #pCR OTvB
+# #limBC = limma batch correction, top2 = pCR OTvB, b = ~0 + RESPTIME + TREATMENT + ER+ PR model.
+# 
+# shared <- broad_limBC_top2c %>%  
+#     filter(rownames(broad_limBC_top2c) %in% ModBC_intersect_pCR_OTvB) #all of the probes identified as DE by all 9 models in the pCR OTvB comparison. 
+# 
+# plot1<- broad_limBC_top2c %>% 
+#   ggplot(aes(x = logFC,
+#              y = -log10(adj.P.Val))) + 
+#   geom_point(colour = "grey", alpha = 0.5)  + 
+#   geom_point(data = shared, # New layer containing data subset of probes identified as DE by all 9 models in this comparison
+#              size = 2,
+#              fill = "black",
+#              colour = "firebrick") +
+#   xlim(-4,7.5) +
+#   ylim(0,80) +
+#   geom_hline(yintercept = -log10(0.01),  #change to desired FDR
+#              linetype = "dashed") + 
+#   geom_vline(xintercept = c(-3, 3), #change to desired FC cutoff
+#              linetype = "dashed") 
+# 
+# 
+# #RD OTvB
+# shared <- broad_limBC_top3c %>%
+#     filter(rownames(broad_limBC_top3c) %in% ModBC_intersect_RD_OTvB) #all of the probes identified as DE by all 9 models in the RD OTvB comparison. 
+# 
+# plot2 <- broad_limBC_top3c %>% 
+#   ggplot(aes(x = logFC,
+#              y = -log10(adj.P.Val))) + 
+#   geom_point(colour = "grey", alpha = 0.5)  + 
+#   geom_point(data = shared, # New layer containing data subset of probes identified as DE by all 9 models in the RD OTvB comparison
+#              size = 2,
+#              fill = "black",
+#              colour = "firebrick") +
+#   xlim(-4,7.5) +
+#   ylim(0,80) +
+#   geom_hline(yintercept = -log10(0.01),  #change to desired FDR
+#              linetype = "dashed") + 
+#   geom_vline(xintercept = c(-3, 3), #change to desired FC cutoff
+#              linetype = "dashed") 
+
+
+
+
+ 
+# ### Y COMMON DEGs between the comparisons ###
+# 
+# # identify the probes that are DE according to all 9 models in both the pCR OTvB and RD OTvB comparisons. 
+# all_common <- intersect(ModBC_intersect_pCR_OTvB,ModBC_intersect_RD_OTvB)
+# 
+# #PCR OTvB
+# shared <- broad_limBC_top2c %>%
+#     filter(rownames(broad_limBC_top2c) %in% all_common) #filter all genes for those genes that are DE according to all 9 models in both the pCR OTvB and RD OTvB comparisons
+# 
+# plot3 <- broad_limBC_top2c %>% 
+#   ggplot(aes(x = logFC,
+#              y = -log10(adj.P.Val))) + 
+#   geom_point(colour = "grey", alpha = 0.5)  + 
+#   geom_point(data = shared, # New layer containing data subset
+#              size = 2,
+#              fill = "black",
+#              colour = "firebrick") +
+#   xlim(-4,7.5) +
+#   ylim(0,80) +
+#   geom_hline(yintercept = -log10(0.01),
+#              linetype = "dashed") + 
+#   geom_vline(xintercept = c(-3, 3),
+#              linetype = "dashed") 
+# 
+# 
+# # RD OTvB
+# shared <- broad_limBC_top3c %>%
+#     filter(rownames(broad_limBC_top3c) %in% all_common)
+# 
+# plot4 <- broad_limBC_top3c %>% 
+#   ggplot(aes(x = logFC,
+#              y = -log10(adj.P.Val))) + 
+#   geom_point(colour = "grey", alpha = 0.5)  + 
+#   geom_point(data = shared, # New layer containing data subset
+#              size = 2,
+#              fill = "black",
+#              colour = "firebrick") +
+#   xlim(-4,7.5) +
+#   ylim(0,80) +
+#   geom_hline(yintercept = -log10(0.01),
+#              linetype = "dashed") + 
+#   geom_vline(xintercept = c(-3, 3),
+#              linetype = "dashed") 
+# 
+# 
+
+
+
+# ### UNIQUE DEGs ###
+# 
+# 
+# #option 1 - look at only the DEGs unique to pCR OTvB on pCR OTvB plot (and same for RD OTvB). 
+# pCR_unique <- setdiff(ModBC_intersect_pCR_OTvB, ModBC_intersect_RD_OTvB) #genes unique to pCR OTvB
+# 
+# unique <- broad_limBC_top2c %>%
+#     filter(rownames(broad_limBC_top2c) %in% pCR_unique)
+# 
+# 
+# plot5 <- broad_limBC_top2c %>% 
+#   ggplot(aes(x = logFC,
+#              y = -log10(adj.P.Val))) + 
+#   geom_point(colour = "grey", alpha = 0.5)  + 
+#   geom_point(data = unique, # New layer containing data subset
+#              size = 2,
+#              fill = "black",
+#              colour = "firebrick") +
+#   xlim(-4,7.5) +
+#   ylim(0,80) +
+#   geom_hline(yintercept = -log10(0.01),
+#              linetype = "dashed") + 
+#   geom_vline(xintercept = c(-3, 3),
+#              linetype = "dashed") 
+# 
+# 
+# 
+# #RD OTvB
+# RD_unique <- setdiff(ModBC_intersect_RD_OTvB, ModBC_intersect_pCR_OTvB) #genes unique to RD OTvB
+# 
+# unique <- broad_limBC_top3c %>%
+#     filter(rownames(broad_limBC_top3c) %in% RD_unique)
+# 
+# plot6 <- broad_limBC_top3c %>% 
+#   ggplot(aes(x = logFC,
+#              y = -log10(adj.P.Val))) + 
+#   geom_point(colour = "grey", alpha = 0.5)  + 
+#   geom_point(data = unique, # New layer containing data subset
+#              size = 2,
+#              fill = "black",
+#              colour = "firebrick") +
+#   xlim(-4,7.5) +
+#   ylim(0,80) +
+#   geom_hline(yintercept = -log10(0.01),
+#              linetype = "dashed") + 
+#   geom_vline(xintercept = c(-3, 3),
+#              linetype = "dashed") 
+# 
+# 
+# #option 2 - plotting the outersect (unique DEGs from both comparisons) to see spread of DEGs across the comparisons.
+
+# sym_diff <- function(a,b) setdiff(union(a,b), intersect(a,b)) #make function to find the genes in the outersect.
+# pCR_RD_unique <- sym_diff(ModBC_intersect_pCR_OTvB, ModBC_intersect_RD_OTvB) #symmetrical difference between the two intersects - contains unique probes for BOTH pCR OTvB and RD OTvB
+# 
+# #pCR OTvB
+# unique <- broad_limBC_top2c %>%
+#     filter(rownames(broad_limBC_top2c) %in% pCR_RD_unique)
+# 
+# plot7 <- broad_limBC_top2c %>%
+#   ggplot(aes(x = logFC,
+#              y = -log10(adj.P.Val))) +
+#   geom_point(colour = "grey", alpha = 0.5)  +
+#   geom_point(data = unique, # New layer containing data subset
+#              size = 2,
+#              fill = "black",
+#              colour = "firebrick") +
+#   xlim(-4,7.5) +
+#   ylim(0,80) +
+#   geom_hline(yintercept = -log10(0.01),
+#              linetype = "dashed") +
+#   geom_vline(xintercept = c(-3, 3),
+#              linetype = "dashed")
+# 
+# 
+# #RD OTvB
+# unique <- broad_limBC_top3c %>%
+#     filter(rownames(broad_limBC_top3c) %in% pCR_RD_unique)
+# 
+# unique_RD_OTvB <- broad_limBC_top3csig %>%
+#   filter(rownames(broad_limBC_top3csig) %in% rownames(unique))
+# 
+# plot8 <- broad_limBC_top3c %>%
+#   ggplot(aes(x = logFC,
+#              y = -log10(adj.P.Val))) +
+#   geom_point(colour = "grey", alpha = 0.5)  +
+#   geom_point(data = unique, # New layer containing data subset
+#              size = 2,
+#              fill = "black",
+#              colour = "firebrick") +
+#   xlim(-4,7.5) +
+#   ylim(0,80) +
+#   geom_hline(yintercept = -log10(0.01),
+#              linetype = "dashed") +
+#   geom_vline(xintercept = c(-3, 3),
+#              linetype = "dashed")
+# 
+# library(patchwork)
+# (plot1 | plot3 | plot5) / (plot2 | plot4 |plot6)
+# #(plot1 | plot3 | plot5 |plot7) / (plot2 | plot4 |plot6 | plot8)
+
+```
+
+
+# What genes are DE? 
+- Looking at the 20/27 DE genes from Bonferroni corrected, FDR 0.01, |logFC| >3 (model C: ~0 + RESP_TIME + TREATMENT + ER_STATUS + PR_STATUS)
+```{r}
+
+#Join the gene names to the fold change values for the pCR OTvB comparison
+x1 <- annot %>% filter(probes %in% rownames(broad_limBC_top2csig)) #filter for DE probes
+x1 <- x1 %>% filter(probes %in% ModBC_intersect_pCR_OTvB) #get only those that are DE across all 9 models. 
+
+y1 <- broad_limBC_top2csig %>% filter(rownames(broad_limBC_top2csig) %in% x1$probes)
+y1 <- y1 %>% mutate(probes = rownames(y1)) %>% dplyr::select(probes, logFC)
+y1 <- full_join(y1,x1, by = "probes")
+
+
+#Same thing for RD OTvB
+x2 <- annot %>% filter(probes %in% rownames(broad_limBC_top3csig))
+x2 <- x2 %>% filter(probes %in% ModBC_intersect_RD_OTvB)
+
+y2 <- broad_limBC_top3csig %>% filter(rownames(broad_limBC_top3csig) %in% x2$probes)
+y2 <- y2 %>% mutate(probes = rownames(y2)) %>% dplyr::select(probes, logFC)
+y2 <- full_join(y2,x2, by = "probes")
+
+
+y3 <- full_join(y1,y2, by = "probes", suffix = c("_pCR", "_RD")) %>% dplyr::select(-c(entrezgene_id_RD, hgnc_symbol_RD)) %>% dplyr::select(probes, entrezgene_id_pCR, hgnc_symbol_pCR, logFC_pCR, logFC_RD)
+colnames(y3) <- c("probes", "entrezgene_id", "hgnc_symbol", "logFC_pCR", "logFC_RD")
+y3 <- y3 %>% mutate(difference_RD_minus_pCR = logFC_RD - logFC_pCR) %>% arrange(desc(logFC_pCR))
+y3 <- y3 %>% distinct()
+
+
+#DEGS in BOTH COMPARISONS
+y3_both <- y3 %>% filter(!is.na(logFC_RD)) %>% filter(!is.na(logFC_pCR))
+
+
+#DEGS in pCR OTvB ONLY
+y3_pCR <- y3 %>% filter(is.na(logFC_RD)) #exlucde rows where RD column has a value
+
+
+#DEGS in RD OTvB only
+y3_RD <- y3 %>% filter(is.na(logFC_pCR)) #exlucde rows where pCR column has a value
+
+```
+
+
+### **7. p-value distributions **
+Look at p-value distributions for each batch correction method and covariate-adjusted model. 
+- 
+```{r}
+
+#broad DEA - pCR vs RD overall
+
+#No BC - broad_noBC_top3c
+
+#BC in limma - broad_limBC_top3c
+
+#ComBat - broad_ComBat_top3c
+
+
+par(mfrow=c(2,3))
+#unadjusted p value
+hist(broad_noBC_top1c$P.Value, ylim = c(0,15000), main = "p-value dist. of probes (all pCR samples vs all RD samples, no BC)", cex.main=1.5)
+hist(broad_limBC_top1c$P.Value, ylim = c(0,15000), main = "p-value dist. of probes (all pCR samples vs all RD samples, BC in limma design)",cex.main=1.5)
+hist(broad_ComBat_top1c$P.Value, ylim = c(0,15000), main = "p-value dist. of probes (all pCR samples vs all RD samples, ComBat)",cex.main=1.5)
+
+#adj p values
+hist(broad_noBC_top1c$adj.P.Val, ylim = c(0,15000), main = "adj.p-value dist. of probes (all pCR samples vs all RD samples, no BC)",cex.main=1.5)
+hist(broad_limBC_top1c$adj.P.Val, ylim = c(0,15000), main = "adj.p-value dist. of probes (all pCR samples vs all RD samples, BC in limma design)",cex.main=1.5)
+hist(broad_ComBat_top1c$adj.P.Val, ylim = c(0,15000), main = "adj.p-value dist. of probes (all pCR samples vs all RD samples, ComBat)",cex.main=1.5)
+plot(c(1,2))# random plot because last plot keeps not showing up when i'm using par(mfrow=c(x,y))
+
+
+#group size for pCR and RD
+View(matched_eset_metadata %>% count(drug_response)) #Overall, 76 in pCR, 102 in RD 
+
+#variances for pCR and RD
+#Adjusted (non combat data) are left skewed in the pCRvRD comparison. So is combat but calculate variance for those separately because it uses batch_corrected_matched_eset
+x <- matched_eset_metadata %>% filter(drug_response == "PCR")
+y <- matched_eset_filt[,colnames(matched_eset_filt) %in% x$geo_accession]
+row_wise_var <- rowVars(y) #variance for each probe
+range(row_wise_var) #0.08180948 14.00689199   #note this range is across ALL PROBES. 
+
+x <- matched_eset_metadata %>% filter(drug_response == "RD")
+y <- matched_eset_filt[,colnames(matched_eset_filt) %in% x$geo_accession]
+row_wise_var <- rowVars(y) #variance for each probe
+range(row_wise_var) #0.1007598 14.7206939  #note this range is across ALL PROBES. 
+
+#larger variance in pCR group. 
+
+
+#group size for RD OT vs B
+View(matched_eset_metadata %>% count(drug_response, sample_type)) #38 pCR OT and 38 pCR B.    For RD, 51 for OT and 51 for B  [bc i'm using matched samples only]
+
+#variance for non-combat
+x <- matched_eset_metadata %>% filter(drug_response == "PCR" & sample_type == "Breast tumor baseline")
+y <- matched_eset_filt[,colnames(matched_eset_filt) %in% x$geo_accession]
+row_wise_var <- rowVars(y) #variance for each probe
+range(row_wise_var) #0.04502756 8.01925184   #note this range is across ALL PROBES. 
+
+x <- matched_eset_metadata %>% filter(drug_response == "RD" & sample_type != "Breast tumor baseline")
+y <- matched_eset_filt[,colnames(matched_eset_filt) %in% x$geo_accession]
+row_wise_var <- rowVars(y) #variance for each probe
+range(row_wise_var) #0.0259457 8.1896407  #note this range is across ALL PROBES. 
+
+#larger variance in pCR group. 
+
+
+## Repeat for PCR_OTvB - distribution looks ok 
+par(mfrow=c(2,3))
+#unadjusted p value
+hist(broad_noBC_top2c$P.Value, ylim = c(0,15000), main = "p-value dist. of probes (pCR on-treatment vs pCR baseline, no BC)", cex.main=1.5)
+hist(broad_top2c$P.Value, ylim = c(0,15000), main = "p-value dist. of probes (pCR on-treatment vs pCR baseline, BC in limma design)",cex.main=1.5)
+hist(broad_ComBat_top2c$P.Value, ylim = c(0,15000), main = "p-value dist. of probes (pCR on-treatment vs pCR baseline, ComBat)",cex.main=1.5)
+
+#adj p values
+hist(broad_noBC_top2c$adj.P.Val, ylim = c(0,15000), main = "adj.p-value dist. of probes (pCR on-treatment vs pCR baseline, no BC)",cex.main=1.5)
+hist(broad_top2c$adj.P.Val, ylim = c(0,15000), main = "adj.p-value dist. of probes (pCR on-treatment vs pCR baseline, BC in limma design)",cex.main=1.5)
+hist(broad_ComBat_top2c$adj.P.Val, ylim = c(0,15000), main = "adj.p-value dist. of probes (pCR on-treatment vs pCR baseline, ComBat)",cex.main=1.5)
+plot(c(1,2)) # random plot because last plot keeps not showing up when i'm using par(mfrow=c(x,y))
+
+
+#BH for non-combat data
+x <- matched_eset_metadata %>% filter(drug_response == "PCR" & sample_type == "after 2-weeks of treatments with HER2-targeted therapy")
+y <- matched_eset_filt[,colnames(matched_eset_filt) %in% x$geo_accession]
+row_wise_var <- rowVars(y)
+range(row_wise_var) #0.02771262 6.71193216
+
+
+x <- matched_eset_metadata %>% filter(drug_response == "PCR" & sample_type == "Breast tumor baseline")
+y <- matched_eset_filt[,colnames(matched_eset_filt) %in% x$geo_accession]
+row_wise_var <- rowVars(y)
+range(row_wise_var) #0.04502756 8.01925184
+
+
+
+## Repeat for RD_OTvB 
+par(mfrow=c(2,3))
+#unadjusted p value
+hist(broad_noBC_top3c$P.Value, ylim = c(0,15000), main = "p-value dist. of probes (RD on-treatment vs RD baseline, no BC)", cex.main=1.5)
+hist(broad_top3c$P.Value, ylim = c(0,15000), main = "p-value dist. of probes (RD on-treatment vs RD baseline, BC in limma design)",cex.main=1.5)
+hist(broad_ComBat_top3c$P.Value, ylim = c(0,15000), main = "p-value dist. of probes (RD on-treatment vs RD baseline, ComBat)",cex.main=1.5)
+
+#adj p values
+hist(broad_noBC_top3c$adj.P.Val, ylim = c(0,15000), main = "adj.p-value dist. of probes (RD on-treatment vs RD baseline, no BC)",cex.main=1.5)
+hist(broad_top3c$adj.P.Val, ylim = c(0,15000), main = "adj.p-value dist. of probes (RD on-treatment vs RD baseline, BC in limma design)",cex.main=1.5)
+hist(broad_ComBat_top3c$adj.P.Val, ylim = c(0,15000), main = "adj.p-value dist. of probes (RD on-treatment vs RD baseline, ComBat)",cex.main=1.5)
+plot(c(1,2))# random plot because last plot keeps not showing up when i'm using par(mfrow=c(x,y))
+
+
+#BH for non-combat data
+x <- matched_eset_metadata %>% filter(drug_response == "RD" & sample_type == "after 2-weeks of treatments with HER2-targeted therapy")
+y <- matched_eset_filt[,colnames(matched_eset_filt) %in% x$geo_accession]
+row_wise_var <- rowVars(y)
+range(row_wise_var) #0.02771262 6.71193216
+
+
+x <- matched_eset_metadata %>% filter(drug_response == "RD" & sample_type == "Breast tumor baseline")
+y <- matched_eset_filt[,colnames(matched_eset_filt) %in% x$geo_accession]
+row_wise_var <- rowVars(y)
+range(row_wise_var) #0.04502756 8.01925184
+```
+
+
+
+# make a 3x3 of volcano plots for each pCRvRD, pCR OTvB, and RD OTvB. Use data from each batch correction variation using model C (all covariates)
+
+```{r}
+# par(mfrow = c(3,3))
+# 
+# ### NO BC
+# #pCR v RD
+# plot(broad_noBC_top1c$logFC,-log10(broad_noBC_top1c$adj.P.Val), main="DEGs between PCR and RD overall", xlab="log2(pCR_OT-B/RD_OT-B)", ylab="-log10(adj P value)",  xlim = c(-4,7), ylim = c(0,80))
+# text(3, 70, label = "Upregulated in pCR pts", cex = 1.5)
+# abline(v=1.5, col="red")
+# abline(v= -1.5, col="red")
+# abline(h=1.3, col="green")
+# 
+# # pCR OTvB
+# plot(broad_noBC_top2c$logFC,-log10(broad_noBC_top2c$adj.P.Val), main="DEGs in pts who had pCR (baseline vs on-treatment)", xlab="log2(pCR_OT/pCR_B)", ylab="-log10(adj P value)",xlim = c(-4,7), ylim = c(0,80))
+# text(-3, 70, label = "Downreg when OT", cex = 1.5)  #constrast made is on-treatment - baseline. So this is looking at DE relative to on-treatment samples. 
+# text(3, 70, label = "Upregulated when OT", cex = 1.5)
+# abline(v=1.5, col="red")
+# abline(v= -1.5, col="red")
+# abline(h=1.3, col="green")
+# 
+# #RD OTvB
+# plot(broad_noBC_top3c$logFC,-log10(broad_noBC_top3c$adj.P.Val), main="DEGs in pts who had RD (baseline vs on-treatment)", xlab="log2(RD_OT/RD_B)", ylab="-log10(adj P value)", xlim = c(-4,7), ylim = c(0,80))
+# text(-3, 70, label = "Downreg when OT", cex = 1.5)  #constrast made is on-treatment - baseline. So this is 
+# text(3, 70, label = "Upregulated when OT", cex = 1.5)
+# abline(v=1.5, col="red")
+# abline(v= -1.5, col="red")
+# abline(h=1.3, col="green")
+# 
+# 
+# ### BC IN LIMMA
+# #pCR v RD
+# plot(broad_limBC_top1c$logFC,-log10(broad_limBC_top1c$adj.P.Val), main="DEGs between PCR and RD overall", xlab="log2(pCR_OT-B/RD_OT-B)", ylab="-log10(adj P value)", xlim = c(-4,7), ylim = c(0,80))
+# text(-3, 70, label = "Downreg in pCR pts", cex = 1.5)  #constrast made is on-treatment - baseline. So this is 
+# text(3, 70, label = "Upregulated in pCR pts", cex = 1.5)
+# abline(v=1.5, col="red")
+# abline(v= -1.5, col="red")
+# abline(h=1.3, col="green")
+# 
+# # pCR OTvB
+# plot(broad_limBC_top2c$logFC,-log10(broad_limBC_top2c$adj.P.Val), main="DEGs in ptswho had pCR (baseline vs on-treatment)", xlab="log2(pCR_OT/pCR_B)", ylab="-log10(adj P value)", xlim = c(-4,7), ylim = c(0,80))
+# text(3, 70, label = "Upregulated when OT", cex = 1.5)
+# abline(v=1.5, col="red")
+# abline(v= -1.5, col="red")
+# abline(h=1.3, col="green")
+# 
+# # RD OTvB
+# plot(broad_limBC_top3c$logFC,-log10(broad_limBC_top3c$adj.P.Val), main="DEGs in pts who had RD (baseline vs on-treatment)", xlab="log2(RD_OT/RD_B)", ylab="-log10(adj P value)", xlim = c(-4,7), ylim = c(0,80))
+# text(-3, 70, label = "Downreg when OT", cex = 1.5)  #constrast made is on-treatment - baseline. So this is 
+# text(3, 70, label = "Upregulated when OT", cex = 1.5)
+# abline(v=1.5, col="red")
+# abline(v= -1.5, col="red")
+# abline(h=1.3, col="green")
+# 
+# 
+# ### COMBAT
+# # pCR v RD
+# plot(broad_ComBat_top1c$logFC,-log10(broad_ComBat_top1c$adj.P.Val), main="DEGs between PCR and RD overall", xlab="log2(pCR_OT-B/RD_OT-B)", ylab="-log10(adj P value)",  xlim = c(-4,7), ylim = c(0,80))#, cex=1.5,cex.main=2.5, cex.axis=1.5, cex.lab=2, pch=21, col="black") 
+# text(-3, 70, label = "Downreg in pCR pts", cex = 1.5)  #constrast made is on-treatment - baseline. So this is 
+# text(3, 70, label = "Upregulated in pCR pts", cex = 1.5)
+# abline(v=1.5, col="red")
+# abline(v= -1.5, col="red")
+# abline(h=1.3, col="green")
+# 
+# plot(broad_ComBat_top2c$logFC,-log10(broad_ComBat_top2c$adj.P.Val), main="DEGs in pts who had pCR (baseline vs on-treatment)", xlab="log2(pCR_OT/pCR_B)", ylab="-log10(adj P value)",xlim = c(-4,7), ylim = c(0,80))#, cex=1.5,cex.main=2.5, cex.axis=1.5, cex.lab=2, pch=21, col="black") # xlim = c(-7,7), ylim = c(0,70)
+# text(-3, 70, label = "Downreg when OT", cex = 1.5)  #constrast made is on-treatment - baseline. So this is looking at DE relative to on-treatment samples. 
+# text(3, 70, label = "Upregulated when OT", cex = 1.5)
+# abline(v=1.5, col="red")
+# abline(v= -1.5, col="red")
+# abline(h=1.3, col="green")
+# 
+# plot(broad_ComBat_top3c$logFC,-log10(broad_ComBat_top3c$adj.P.Val), main="DEGs in pts who had RD (baseline vs on-treatment)", xlab="log2(RD_OT/RD_B)", ylab="-log10(adj P value)", xlim = c(-4,7), ylim = c(0,80))#, cex=1.5,cex.main=2.5, cex.axis=1.5, cex.lab=2, pch=21, col="black") # xlim = c(-7,7), ylim = c(0,70)
+# text(-3, 70, label = "Downreg when OT", cex = 1.5)  #constrast made is on-treatment - baseline. So this is 
+# text(3, 70, label = "Upregulated when OT", cex = 1.5)
+# abline(v=1.5, col="red")
+# abline(v= -1.5, col="red")
+# abline(h=1.3, col="green")
+# 
+# plot(c(1,2)) #random plot because par(mfrow = c(x,y)) won't show last plot
+```
